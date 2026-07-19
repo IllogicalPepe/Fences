@@ -1,0 +1,25 @@
+# Build outputs / packages
+dist/
+**/bin/
+**/obj/
+*.zip
+*.exe
+*.msi
+*.pdb
+
+# Secrets / local
+.env
+*.user
+*.log
+.vs/
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Python / caches if any
+__pycache__/
+*.pyc
+.venv/

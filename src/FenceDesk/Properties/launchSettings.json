@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "FenceDesk (Package)": {
+      "commandName": "MsixPackage"
+    },
+    "FenceDesk (Unpackaged)": {
+      "commandName": "Project"
+    }
+  }
+}

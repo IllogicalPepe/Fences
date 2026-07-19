@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationIcon>..\..\Assets\FenceDesk.ico</ApplicationIcon>
+    <AssemblyName>FenceDesk</AssemblyName>
+    <RootNamespace>FenceDesk</RootNamespace>
+    <Version>2.0.0</Version>
+    <Description>Desktop fence organizer for Windows (C# + WPF)</Description>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="..\..\Assets\FenceDesk.ico" Link="Assets\FenceDesk.ico" Condition="Exists('..\..\Assets\FenceDesk.ico')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Drawing.Common" Version="8.0.11" />
+  </ItemGroup>
+</Project>
