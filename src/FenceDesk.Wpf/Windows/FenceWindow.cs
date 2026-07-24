@@ -39,19 +39,30 @@ public sealed class FenceWindow : Window
     private System.Windows.Point _groupDragScreenStart;
     private readonly Dictionary<string, (double L, double T)> _groupDragOrigins = new();
 
-    // Multi-select state (paths of selected tiles) — marquee via Ctrl+drag
+    // Multi-select state (paths of selected tiles) — desktop-style marquee on empty area
     private readonly HashSet<string> _selectedPaths = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, Border> _tileByPath = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<string> _itemOrder = new();
+    private bool _marqueePending;
     private bool _marqueeActive;
+    private bool _marqueeAdditive;
+    private HashSet<string>? _marqueeBaseSelection;
     private System.Windows.Point _marqueeStartBody;
     private Border? _marqueeVisual;
+    private string? _selectionAnchor;
+    private Border? _insertMarker;
+
+    /// <summary>Fence that started the current item drag (so source fence can reject self-drops).</summary>
+    internal static string? DragSourceFenceId;
 
     public bool ToggleHidden { get; set; }
     public string FenceId => _model.Id;
 
     /// <summary>True when fence is visually shown (not soft-hidden).</summary>
     public bool IsOnScreen => !ToggleHidden;
+
+    /// <summary>Last Win32 topmost pin state (WPF Topmost stays false to avoid DWM flash).</summary>
+    public bool IsPinnedTopmost { get; private set; }
 
     public FenceWindow(FenceManager manager, FenceModel model)
     {
@@ -119,7 +130,7 @@ public sealed class FenceWindow : Window
             FontWeight = FontWeights.SemiBold,
             Foreground = new SolidColorBrush(Color.FromRgb(200, 208, 220)),
             VerticalAlignment = VerticalAlignment.Center,
-            ToolTip = "Double-click title to roll up · Ctrl+drag to multi-select"
+            ToolTip = "Double-click title to roll up · drag on empty area to multi-select"
         };
         titleBar.Child = _titleText;
 
@@ -166,7 +177,7 @@ public sealed class FenceWindow : Window
         titleBar.PreviewMouseMove += TitleBar_MouseMove;
         titleBar.PreviewMouseLeftButtonUp += TitleBar_MouseLeftButtonUp;
         titleBar.LostMouseCapture += (_, _) => EndGroupDrag(snap: true);
-        // Empty body: clear selection. Ctrl+drag: marquee multi-select (no roll-up on double-click).
+        // Empty body: click-drag marquee multi-select (desktop style). Tiles handle their own select/drag.
         _body.PreviewMouseLeftButtonDown += Body_PreviewMouseLeftButtonDown;
         _body.PreviewMouseMove += Body_PreviewMouseMove;
         _body.PreviewMouseLeftButtonUp += Body_PreviewMouseLeftButtonUp;
@@ -198,7 +209,9 @@ public sealed class FenceWindow : Window
         };
         AllowDrop = true;
         DragOver += OnDragOver;
+        DragLeave += OnDragLeave;
         Drop += OnDrop;
+        GiveFeedback += OnGiveFeedback;
 
         BuildContextMenu();
         RefreshContent();
@@ -321,19 +334,52 @@ public sealed class FenceWindow : Window
 
     private void OnDragOver(object sender, System.Windows.DragEventArgs e)
     {
+        // FileDrop for normal files; Shell IDList for virtual desktop icons (Recycle Bin, This PC, …)
         if (e.Data.GetDataPresent(DataFormats.FileDrop) ||
             e.Data.GetDataPresent(FenceItemFormat) ||
-            e.Data.GetDataPresent(DataFormats.StringFormat))
+            e.Data.GetDataPresent(DataFormats.StringFormat) ||
+            ShellIdListDrop.IsPresent(e.Data))
         {
-            // Prefer Move when reordering/transferring fence items; Copy for OS file drops
-            e.Effects = e.Data.GetDataPresent(FenceItemFormat)
-                ? DragDropEffects.Move
-                : DragDropEffects.Copy;
+            var sameFenceReorder = e.Data.GetDataPresent(FenceItemFormat) &&
+                string.Equals(DragSourceFenceId, _model.Id, StringComparison.Ordinal) &&
+                !_model.IsPortal;
+
+            if (sameFenceReorder)
+            {
+                e.Effects = DragDropEffects.Move;
+                var paths = ExtractDropPaths(e.Data);
+                var dragging = new HashSet<string>(paths, StringComparer.OrdinalIgnoreCase);
+                var insert = GetReorderInsertIndex(e.GetPosition(_itemsPanel), dragging);
+                ShowInsertMarker(insert, dragging);
+            }
+            else
+            {
+                HideInsertMarker();
+                e.Effects = e.Data.GetDataPresent(FenceItemFormat)
+                    ? DragDropEffects.Move
+                    : DragDropEffects.Copy;
+            }
         }
         else
         {
+            HideInsertMarker();
             e.Effects = DragDropEffects.None;
         }
+        e.Handled = true;
+    }
+
+    private void OnDragLeave(object sender, System.Windows.DragEventArgs e)
+    {
+        // DragLeave also fires when moving over child elements — only hide when truly leaving
+        var p = e.GetPosition(this);
+        if (p.X < 0 || p.Y < 0 || p.X > ActualWidth || p.Y > ActualHeight)
+            HideInsertMarker();
+    }
+
+    private void OnGiveFeedback(object sender, System.Windows.GiveFeedbackEventArgs e)
+    {
+        // Use the standard OLE cursors — avoids a stuck/custom "second cursor" on layered windows
+        e.UseDefaultCursors = true;
         e.Handled = true;
     }
 
@@ -342,19 +388,128 @@ public sealed class FenceWindow : Window
         try
         {
             var paths = ExtractDropPaths(e.Data);
-            if (paths.Count == 0) return;
+            if (paths.Count == 0)
+            {
+                AppLog.Write("Drop: no paths extracted (formats: " +
+                             string.Join(", ", e.Data.GetFormats(true) ?? Array.Empty<string>()) + ")");
+                return;
+            }
 
             LastDropFenceId = _model.Id;
+
+            // Same-fence drop → rearrange icons instead of re-adding
+            if (e.Data.GetDataPresent(FenceItemFormat) &&
+                string.Equals(DragSourceFenceId, _model.Id, StringComparison.Ordinal) &&
+                !_model.IsPortal)
+            {
+                var dragging = new HashSet<string>(paths, StringComparer.OrdinalIgnoreCase);
+                var insert = GetReorderInsertIndex(e.GetPosition(_itemsPanel), dragging);
+                _manager.ReorderItems(_model.Id, paths, insert);
+                e.Effects = DragDropEffects.Move;
+                AppLog.Write("Reorder drop: " + string.Join("; ", paths));
+                return;
+            }
+
             _manager.AddItems(_model.Id, paths);
             e.Effects = e.Data.GetDataPresent(FenceItemFormat)
                 ? DragDropEffects.Move
                 : DragDropEffects.Copy;
+            AppLog.Write("Drop accepted: " + string.Join("; ", paths));
         }
         catch (Exception ex)
         {
             AppLog.Write($"Drop: {ex.Message}");
         }
-        e.Handled = true;
+        finally
+        {
+            HideInsertMarker();
+            e.Handled = true;
+        }
+    }
+
+    /// <summary>
+    /// Insert index among items that are not being dragged (WrapPanel reading order).
+    /// </summary>
+    private int GetReorderInsertIndex(System.Windows.Point posInItemsPanel, HashSet<string> dragging)
+    {
+        var remaining = _itemOrder.Where(p => !dragging.Contains(p)).ToList();
+        for (var i = 0; i < remaining.Count; i++)
+        {
+            if (!_tileByPath.TryGetValue(remaining[i], out var tile)) continue;
+            try
+            {
+                var origin = tile.TranslatePoint(new System.Windows.Point(0, 0), _itemsPanel);
+                var cx = origin.X + tile.ActualWidth / 2;
+                var top = origin.Y;
+                var bottom = origin.Y + tile.ActualHeight;
+                var aboveRow = posInItemsPanel.Y < top;
+                var sameRow = posInItemsPanel.Y >= top && posInItemsPanel.Y <= bottom;
+                if (aboveRow || (sameRow && posInItemsPanel.X < cx))
+                    return i;
+            }
+            catch { /* layout race */ }
+        }
+        return remaining.Count;
+    }
+
+    private void ShowInsertMarker(int insertIndex, HashSet<string> dragging)
+    {
+        if (_insertMarker is null)
+        {
+            _insertMarker = new Border
+            {
+                Width = 2,
+                Background = new SolidColorBrush(Color.FromRgb(80, 150, 255)),
+                HorizontalAlignment = HorizontalAlignment.Left,
+                VerticalAlignment = VerticalAlignment.Top,
+                IsHitTestVisible = false,
+                CornerRadius = new CornerRadius(1)
+            };
+            _body.Children.Add(_insertMarker);
+            System.Windows.Controls.Panel.SetZIndex(_insertMarker, 100);
+        }
+
+        var remaining = _itemOrder.Where(p => !dragging.Contains(p)).ToList();
+        double x = 8, y = 8, h = Math.Max(24, _manager.Icons.IconSize + 20);
+
+        try
+        {
+            if (remaining.Count == 0)
+            {
+                // Empty (all items dragged) — mark start of panel
+                var panelOrigin = _itemsPanel.TranslatePoint(new System.Windows.Point(0, 0), _body);
+                x = panelOrigin.X + 4;
+                y = panelOrigin.Y + 4;
+            }
+            else if (insertIndex >= remaining.Count)
+            {
+                if (_tileByPath.TryGetValue(remaining[^1], out var last))
+                {
+                    var tl = last.TranslatePoint(new System.Windows.Point(0, 0), _body);
+                    x = tl.X + last.ActualWidth - 1;
+                    y = tl.Y;
+                    h = Math.Max(24, last.ActualHeight);
+                }
+            }
+            else if (_tileByPath.TryGetValue(remaining[insertIndex], out var tile))
+            {
+                var tl = tile.TranslatePoint(new System.Windows.Point(0, 0), _body);
+                x = tl.X;
+                y = tl.Y;
+                h = Math.Max(24, tile.ActualHeight);
+            }
+        }
+        catch { /* ignore */ }
+
+        _insertMarker.Margin = new Thickness(x, y, 0, 0);
+        _insertMarker.Height = h;
+        _insertMarker.Visibility = Visibility.Visible;
+    }
+
+    private void HideInsertMarker()
+    {
+        if (_insertMarker is not null)
+            _insertMarker.Visibility = Visibility.Collapsed;
     }
 
     private static List<string> ExtractDropPaths(System.Windows.IDataObject data)
@@ -366,7 +521,7 @@ public sealed class FenceWindow : Window
             // FenceItemFormat may be multi-line (multi-select drag)
             foreach (var line in p.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
             {
-                var t = line.Trim().Trim('"');
+                var t = ShellIdListDrop.NormalizeShellPath(line.Trim().Trim('"'));
                 if (t.Length == 0) continue;
                 if (!paths.Contains(t, StringComparer.OrdinalIgnoreCase))
                     paths.Add(t);
@@ -376,6 +531,14 @@ public sealed class FenceWindow : Window
         {
             if (data.GetDataPresent(FenceItemFormat))
                 AddPath(data.GetData(FenceItemFormat) as string);
+
+            // Virtual shell icons (Recycle Bin) — must run even when FileDrop is empty
+            if (ShellIdListDrop.IsPresent(data))
+            {
+                foreach (var p in ShellIdListDrop.ExtractPaths(data))
+                    AddPath(p);
+            }
+
             if (data.GetDataPresent(DataFormats.FileDrop) &&
                 data.GetData(DataFormats.FileDrop) is string[] files)
             {
@@ -386,11 +549,16 @@ public sealed class FenceWindow : Window
             {
                 var s = data.GetData(DataFormats.StringFormat) as string;
                 if (!string.IsNullOrWhiteSpace(s) &&
-                    (s.Contains('\\') || s.StartsWith("::", StringComparison.Ordinal) || s.StartsWith("shell:", StringComparison.OrdinalIgnoreCase)))
+                    (s.Contains('\\') || s.StartsWith("::", StringComparison.Ordinal) ||
+                     s.StartsWith("shell:", StringComparison.OrdinalIgnoreCase) ||
+                     s.Contains("Recycle", StringComparison.OrdinalIgnoreCase)))
                     AddPath(s);
             }
         }
-        catch { /* ignore */ }
+        catch (Exception ex)
+        {
+            AppLog.Write("ExtractDropPaths: " + ex.Message);
+        }
         return paths;
     }
 
@@ -405,6 +573,7 @@ public sealed class FenceWindow : Window
         if (ToggleHidden) return;
         try
         {
+            // Keep WPF Topmost false — HWND_TOPMOST via DesktopPin survives Win+D without DWM flash
             Topmost = false;
             Opacity = 1.0; // whole-window opacity must stay 1; panel alpha is on brushes only
             if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
@@ -421,16 +590,24 @@ public sealed class FenceWindow : Window
             var hwnd = EnsureHwnd();
             if (hwnd != IntPtr.Zero)
             {
-                DesktopPin.EnsureToolWindowStyles(hwnd);
-                // Do NOT SetLayeredWindowAttributes — blanks AllowsTransparency windows
+                var want = useTopmost ?? DesktopPin.ShouldUseTopmost(DesktopPin.CurrentProcessId);
+                // Position without changing z-order, then pin for Win+D / app-focus
                 var x = (int)Math.Round(Left);
                 var y = (int)Math.Round(Top);
                 var w = (int)Math.Round(Math.Max(MinWidth, ActualWidth > 1 ? ActualWidth : Width));
                 var h = (int)Math.Round(Math.Max(MinHeight, ActualHeight > 1 ? ActualHeight : Height));
-                NativeMethods.SetWindowPos(hwnd, NativeMethods.HWND_NOTOPMOST, x, y, w, h,
+                NativeMethods.SetWindowPos(hwnd, IntPtr.Zero, x, y, w, h,
                     NativeMethods.SWP_NOACTIVATE
+                    | NativeMethods.SWP_NOZORDER
                     | NativeMethods.SWP_SHOWWINDOW
                     | NativeMethods.SWP_NOSENDCHANGING);
+                DesktopPin.PinForShowDesktop(hwnd, want);
+                if (raise && want)
+                {
+                    NativeMethods.SetWindowPos(hwnd, NativeMethods.HWND_TOPMOST, 0, 0, 0, 0,
+                        NativeMethods.SWP_NOMOVE | NativeMethods.SWP_NOSIZE | NativeMethods.SWP_NOACTIVATE);
+                }
+                IsPinnedTopmost = want;
             }
             UpdateLockChrome();
             ApplyGlassAppearance();
@@ -651,10 +828,13 @@ public sealed class FenceWindow : Window
         RefreshContent();
     }
 
+    public void RebuildContextMenu() => BuildContextMenu();
+
     public void UpdateLockChrome()
     {
         _model = _manager.LayoutStore.FindFence(_model.Id) ?? _model;
-        var grouped = !string.IsNullOrWhiteSpace(_model.GroupId);
+        // Only treat as grouped when 2+ fences share the id (orphans don't count)
+        var grouped = _manager.IsEffectivelyGrouped(_model.Id);
         var groupName = grouped ? _manager.GetGroupName(_model.GroupId) : string.Empty;
         var prefix = (_model.Locked ? "🔒 " : "") + (grouped ? "⧉ " : "");
         _titleText.Text = string.IsNullOrWhiteSpace(groupName)
@@ -671,7 +851,7 @@ public sealed class FenceWindow : Window
                     ? "Grouped — drag moves all linked fences"
                     : $"Group \"{groupName}\" — drag moves all linked fences";
             else
-                _titleBar.ToolTip = "Double-click title to roll up · Ctrl+drag icons to multi-select";
+                _titleBar.ToolTip = "Double-click title to roll up · drag empty area to multi-select";
         }
 
         // Unlocked: white edge strips + corner grip visible, edges resizable
@@ -786,7 +966,7 @@ public sealed class FenceWindow : Window
                 ? (string.IsNullOrWhiteSpace(_model.PortalPath)
                     ? "No folder selected for portal"
                     : $"Portal is empty\n{_model.PortalPath}")
-                : "Drop files here\nRight-click for options\nCtrl+drag to multi-select";
+                : "Drop files here\nRight-click for options\nDrag to multi-select";
         }
         else
         {
@@ -809,6 +989,20 @@ public sealed class FenceWindow : Window
         }
 
         if (_model.RolledUp) ApplyRollUp();
+    }
+
+    /// <summary>Swap recycle-bin tile artwork when the bin becomes empty or full.</summary>
+    public void RefreshRecycleBinIcons()
+    {
+        var size = _manager.Icons.IconSize;
+        foreach (var path in _itemOrder)
+        {
+            if (!DesktopIconService.IsRecycleBinPath(path)) continue;
+            if (!_tileByPath.TryGetValue(path, out var border)) continue;
+            if (border.Child is not StackPanel stack || stack.Children.Count == 0) continue;
+            if (stack.Children[0] is not Image img) continue;
+            img.Source = _manager.Icons.GetItemImage(path, size);
+        }
     }
 
     private void DeleteTab(string tabId)
@@ -850,14 +1044,16 @@ public sealed class FenceWindow : Window
     private UIElement CreateTile(string path, string label)
     {
         var m = _manager.Icons;
+        // No Margin — gaps are padding so the whole cell is hittable (avoids accidental marquee
+        // when starting a drag near an icon).
         var border = new Border
         {
-            Width = m.TileWidth,
-            Margin = new Thickness(2),
-            Padding = new Thickness(4, 6, 4, 6),
+            Width = m.TileWidth + 4,
+            Margin = new Thickness(0),
+            Padding = new Thickness(6, 6, 6, 6),
             CornerRadius = new CornerRadius(4),
             Background = Brushes.Transparent,
-            Cursor = Cursors.Hand,
+            Cursor = Cursors.Arrow,
             ToolTip = path,
             Tag = path
         };
@@ -900,13 +1096,11 @@ public sealed class FenceWindow : Window
             border.Background = _selectedPaths.Contains(path) ? TileSelectedBrush : Brushes.Transparent;
         };
 
-        // Double-click opens; drag moves item(s). Multi-select = Ctrl+drag marquee on body.
+        // Double-click opens; drag moves item(s). Empty-area marquee multi-selects (desktop style).
         System.Windows.Point? dragOrigin = null;
         border.PreviewMouseLeftButtonDown += (_, e) =>
         {
-            // Ctrl+drag marquee is handled on the body (Preview); don't start item drag under Ctrl
-            if ((Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control)
-                return;
+            if (e.ChangedButton != MouseButton.Left) return;
 
             if (e.ClickCount >= 2)
             {
@@ -916,13 +1110,32 @@ public sealed class FenceWindow : Window
                 return;
             }
 
-            // Plain click: keep multi-selection if this tile is already selected (for group drag);
-            // otherwise select only this tile.
-            if (!_selectedPaths.Contains(path) || _selectedPaths.Count <= 1)
+            var ctrl = (Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control;
+            var shift = (Keyboard.Modifiers & ModifierKeys.Shift) == ModifierKeys.Shift;
+
+            if (ctrl)
             {
-                _selectedPaths.Clear();
-                _selectedPaths.Add(path);
+                // Ctrl+click: toggle this tile in the selection
+                if (!_selectedPaths.Remove(path))
+                    _selectedPaths.Add(path);
+                _selectionAnchor = path;
                 ApplySelectionVisuals();
+            }
+            else if (shift && _selectionAnchor is not null)
+            {
+                SelectRange(_selectionAnchor, path);
+            }
+            else
+            {
+                // Plain click: keep multi-selection if this tile is already selected (for group drag);
+                // otherwise select only this tile.
+                if (!_selectedPaths.Contains(path) || _selectedPaths.Count <= 1)
+                {
+                    _selectedPaths.Clear();
+                    _selectedPaths.Add(path);
+                    ApplySelectionVisuals();
+                }
+                _selectionAnchor = path;
             }
 
             dragOrigin = e.GetPosition(border);
@@ -933,8 +1146,7 @@ public sealed class FenceWindow : Window
         border.PreviewMouseMove += (_, e) =>
         {
             if (dragOrigin is null || e.LeftButton != MouseButtonState.Pressed) return;
-            if ((Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control) return;
-            if (_marqueeActive) return;
+            if (_marqueeActive || _marqueePending) return;
 
             var pos = e.GetPosition(border);
             if (Math.Abs(pos.X - dragOrigin.Value.X) < SystemParameters.MinimumHorizontalDragDistance &&
@@ -952,6 +1164,7 @@ public sealed class FenceWindow : Window
                 _selectedPaths.Add(path);
                 ApplySelectionVisuals();
             }
+            CancelMarquee();
             StartItemDrag(border, paths);
             e.Handled = true;
         };
@@ -1030,17 +1243,78 @@ public sealed class FenceWindow : Window
         ApplySelectionVisuals();
     }
 
+    private static Border? FindTileFromSource(DependencyObject? src)
+    {
+        var cur = src;
+        while (cur is not null)
+        {
+            if (cur is Border b && b.Tag is string)
+                return b;
+            cur = VisualTreeHelper.GetParent(cur);
+        }
+        return null;
+    }
+
+    private void SelectRange(string fromPath, string toPath)
+    {
+        var i0 = _itemOrder.FindIndex(p => string.Equals(p, fromPath, StringComparison.OrdinalIgnoreCase));
+        var i1 = _itemOrder.FindIndex(p => string.Equals(p, toPath, StringComparison.OrdinalIgnoreCase));
+        if (i0 < 0 || i1 < 0)
+        {
+            _selectedPaths.Clear();
+            _selectedPaths.Add(toPath);
+            ApplySelectionVisuals();
+            return;
+        }
+        if (i1 < i0) (i0, i1) = (i1, i0);
+        _selectedPaths.Clear();
+        for (var i = i0; i <= i1; i++)
+            _selectedPaths.Add(_itemOrder[i]);
+        ApplySelectionVisuals();
+    }
+
     private void Body_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
-        // Ctrl + click/drag inside fence body → marquee multi-select
-        if ((Keyboard.Modifiers & ModifierKeys.Control) != ModifierKeys.Control)
-            return;
         if (e.ChangedButton != MouseButton.Left) return;
 
+        // Clicks on icons select/drag the tile — marquee only from empty space (like desktop)
+        if (FindTileFromSource(e.OriginalSource as DependencyObject) is not null)
+            return;
+
+        var additive = (Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control;
+        BeginPendingMarquee(e.GetPosition(_body), additive);
+        e.Handled = true;
+        Focus();
+    }
+
+    /// <summary>
+    /// Arm marquee on empty-area press, but don't show/clear until the mouse actually moves
+    /// past the system drag threshold — so icon drags aren't stolen by a selection box.
+    /// </summary>
+    private void BeginPendingMarquee(System.Windows.Point start, bool additive)
+    {
+        CancelMarquee();
+        _marqueePending = true;
+        _marqueeActive = false;
+        _marqueeAdditive = additive;
+        _marqueeStartBody = start;
+        _marqueeBaseSelection = additive
+            ? new HashSet<string>(_selectedPaths, StringComparer.OrdinalIgnoreCase)
+            : null;
+        _body.CaptureMouse();
+    }
+
+    private void ActivateMarquee()
+    {
+        if (!_marqueePending || _marqueeActive) return;
+        _marqueePending = false;
         _marqueeActive = true;
-        _marqueeStartBody = e.GetPosition(_body);
-        _selectedPaths.Clear();
-        ApplySelectionVisuals();
+
+        if (!_marqueeAdditive)
+        {
+            _selectedPaths.Clear();
+            ApplySelectionVisuals();
+        }
 
         if (_marqueeVisual is null)
         {
@@ -1061,22 +1335,44 @@ public sealed class FenceWindow : Window
         _marqueeVisual.Margin = new Thickness(_marqueeStartBody.X, _marqueeStartBody.Y, 0, 0);
         _marqueeVisual.Width = 0;
         _marqueeVisual.Height = 0;
-
-        _body.CaptureMouse();
-        e.Handled = true;
-        Focus();
     }
 
     private void Body_PreviewMouseMove(object sender, System.Windows.Input.MouseEventArgs e)
     {
-        if (!_marqueeActive || e.LeftButton != MouseButtonState.Pressed) return;
-        UpdateMarquee(e.GetPosition(_body));
-        e.Handled = true;
+        if ((!_marqueePending && !_marqueeActive) || e.LeftButton != MouseButtonState.Pressed)
+            return;
+
+        var pos = e.GetPosition(_body);
+        if (_marqueePending)
+        {
+            if (Math.Abs(pos.X - _marqueeStartBody.X) < SystemParameters.MinimumHorizontalDragDistance &&
+                Math.Abs(pos.Y - _marqueeStartBody.Y) < SystemParameters.MinimumVerticalDragDistance)
+                return;
+            ActivateMarquee();
+        }
+
+        if (_marqueeActive)
+        {
+            UpdateMarquee(pos);
+            e.Handled = true;
+        }
     }
 
     private void Body_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
     {
-        if (!_marqueeActive) return;
+        if (!_marqueePending && !_marqueeActive) return;
+
+        if (_marqueePending)
+        {
+            // Click empty area without dragging → clear selection (desktop behavior)
+            var additive = _marqueeAdditive;
+            CancelMarquee();
+            if (!additive)
+                ClearSelection();
+            e.Handled = true;
+            return;
+        }
+
         UpdateMarquee(e.GetPosition(_body));
         EndMarquee(commit: true);
         e.Handled = true;
@@ -1094,7 +1390,7 @@ public sealed class FenceWindow : Window
         _marqueeVisual.Height = Math.Max(0, h);
 
         var box = new Rect(x, y, Math.Max(1, w), Math.Max(1, h));
-        _selectedPaths.Clear();
+        var hit = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var (path, tile) in _tileByPath)
         {
             try
@@ -1104,23 +1400,40 @@ public sealed class FenceWindow : Window
                 var tileRect = new Rect(topLeft.X, topLeft.Y,
                     Math.Max(1, tile.ActualWidth), Math.Max(1, tile.ActualHeight));
                 if (box.IntersectsWith(tileRect))
-                    _selectedPaths.Add(path);
+                    hit.Add(path);
             }
             catch { /* ignore layout race */ }
         }
+
+        _selectedPaths.Clear();
+        if (_marqueeAdditive && _marqueeBaseSelection is not null)
+        {
+            foreach (var p in _marqueeBaseSelection)
+                _selectedPaths.Add(p);
+        }
+        foreach (var p in hit)
+            _selectedPaths.Add(p);
         ApplySelectionVisuals();
     }
 
     private void EndMarquee(bool commit)
     {
-        if (!_marqueeActive) return;
+        if (!_marqueeActive && !_marqueePending) return;
+        _marqueePending = false;
         _marqueeActive = false;
-        try { _body.ReleaseMouseCapture(); } catch { /* ignore */ }
+        _marqueeAdditive = false;
+        _marqueeBaseSelection = null;
+        try { if (_body.IsMouseCaptured) _body.ReleaseMouseCapture(); } catch { /* ignore */ }
         if (_marqueeVisual is not null)
             _marqueeVisual.Visibility = Visibility.Collapsed;
         if (!commit)
             ClearSelection();
-        // Tiny click with Ctrl and no tiles hit: leave selection empty
+    }
+
+    private void CancelMarquee()
+    {
+        if (!_marqueeActive && !_marqueePending) return;
+        EndMarquee(commit: true);
     }
 
     private void DeleteSelectedOr(string fallbackPath)
@@ -1138,7 +1451,10 @@ public sealed class FenceWindow : Window
         if (paths.Count == 0) return;
         try
         {
+            CancelMarquee();
             LastDropFenceId = null;
+            DragSourceFenceId = _model.Id;
+            AppLog.Write($"StartItemDrag: {paths.Count} item(s) from {_model.Title}");
             var data = new System.Windows.DataObject();
             // Newline-separated so multi-item drops work between fences
             data.SetData(FenceItemFormat, string.Join("\n", paths));
@@ -1200,6 +1516,8 @@ public sealed class FenceWindow : Window
         finally
         {
             LastDropFenceId = null;
+            DragSourceFenceId = null;
+            HideInsertMarker();
         }
     }
 
@@ -1229,6 +1547,9 @@ public sealed class FenceWindow : Window
 
     private void BuildContextMenu()
     {
+        // Always rebuild from live model so group/ungroup state is current
+        _model = _manager.LayoutStore.FindFence(_model.Id) ?? _model;
+
         var cm = new ContextMenu();
         void Add(string header, Action action)
         {
@@ -1317,6 +1638,25 @@ public sealed class FenceWindow : Window
         });
         Add("Reset colors (background + text)", ResetColorsToDefault);
         Add("Opacity...", ShowOpacityDialog);
+        if (!_model.IsPortal)
+        {
+            cm.Items.Add(new Separator());
+            // Virtual desktop icons can't always be dragged on Win11 — offer explicit add
+            var shellMenu = new MenuItem { Header = "Add desktop icon…" };
+            foreach (var kv in DesktopIconService.ShellDesktopIcons.OrderBy(k => k.Value.Name))
+            {
+                var info = kv.Value;
+                var path = info.Path;
+                var mi = new MenuItem { Header = info.Name };
+                mi.Click += (_, _) =>
+                {
+                    try { _manager.AddItems(_model.Id, new[] { path }); }
+                    catch (Exception ex) { AppLog.Write(ex.Message); }
+                };
+                shellMenu.Items.Add(mi);
+            }
+            cm.Items.Add(shellMenu);
+        }
         cm.Items.Add(new Separator());
         Add(_model.Locked ? "Unlock position" : "Lock position", () =>
         {
@@ -1328,9 +1668,8 @@ public sealed class FenceWindow : Window
             var target = _manager.PickFenceToGroupWith(_model.Id);
             if (target is null) return;
             _manager.JoinFenceGroup(_model.Id, target);
-            BuildContextMenu();
         });
-        if (!string.IsNullOrWhiteSpace(_model.GroupId))
+        if (_manager.IsEffectivelyGrouped(_model.Id))
         {
             Add("Rename group…", () =>
             {
@@ -1341,14 +1680,15 @@ public sealed class FenceWindow : Window
                     current);
                 if (name is null) return; // cancelled
                 _manager.SetGroupName(_model.GroupId!, name);
-                BuildContextMenu();
             });
-            Add("Ungroup this fence", () =>
-            {
-                _manager.LeaveFenceGroup(_model.Id);
-                BuildContextMenu();
-            });
+            Add("Ungroup this fence", () => _manager.LeaveFenceGroup(_model.Id));
+            Add("Ungroup all in this group", () => _manager.DissolveFenceGroup(_model.Id));
             Add("Match size to this fence (group)", () => _manager.MatchGroupSize(_model.Id));
+        }
+        else if (!string.IsNullOrWhiteSpace(_model.GroupId))
+        {
+            // Orphan groupId (alone in group) — offer a clean detach
+            Add("Clear stuck group link", () => _manager.LeaveFenceGroup(_model.Id));
         }
         cm.Items.Add(new Separator());
         Add("Delete fence", () =>
@@ -1454,18 +1794,11 @@ public sealed class FenceWindow : Window
     private void EmptyArea_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
         // Ignore if click originated on an item tile
-        if (e.OriginalSource is DependencyObject d)
-        {
-            var cur = d;
-            while (cur is not null && cur != this)
-            {
-                if (cur is Border b && b.Tag is string)
-                    return; // item tile
-                cur = VisualTreeHelper.GetParent(cur);
-            }
-        }
+        if (FindTileFromSource(e.OriginalSource as DependencyObject) is not null)
+            return;
 
-        // Ctrl is handled by marquee on body — don't clear
+        // Marquee on body Preview already owns empty-area left-clicks
+        if (_marqueeActive || _marqueePending) return;
         if ((Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control)
             return;
 
@@ -1486,6 +1819,8 @@ public sealed class FenceWindow : Window
         {
             _selectedPaths.Clear();
             foreach (var p in _itemOrder) _selectedPaths.Add(p);
+            if (_itemOrder.Count > 0)
+                _selectionAnchor = _itemOrder[0];
             ApplySelectionVisuals();
             e.Handled = true;
             return;
@@ -1522,7 +1857,8 @@ public sealed class FenceWindow : Window
         }
         if (e.ChangedButton != MouseButton.Left) return;
 
-        // Group-aware drag (moves linked fences together)
+        // Group-aware drag (moves linked fences together when effectively grouped)
+        _model = _manager.LayoutStore.FindFence(_model.Id) ?? _model;
         _groupDragging = true;
         _groupDragScreenStart = PointToScreen(e.GetPosition(this));
         _groupDragOrigins.Clear();

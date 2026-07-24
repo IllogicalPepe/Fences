@@ -11,6 +11,7 @@ public sealed class IconService
     private readonly Dictionary<string, ImageSource> _cache = new(StringComparer.OrdinalIgnoreCase);
     private readonly DesktopIconService _desktopIcons;
     private int _iconSize = 48;
+    private bool? _lastRecycleBinFull;
 
     public IconService(DesktopIconService desktopIcons)
     {
@@ -19,6 +20,7 @@ public sealed class IconService
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "FenceDesk", "icon-cache"));
         RefreshMetrics();
+        _lastRecycleBinFull = IsRecycleBinFull();
     }
 
     public int IconSize => _iconSize;
@@ -56,6 +58,61 @@ public sealed class IconService
 
     public void ClearCache() => _cache.Clear();
 
+    /// <summary>True when the recycle bin contains at least one item.</summary>
+    public static bool IsRecycleBinFull()
+    {
+        // Prefer Shell.Application — matches Explorer and is reliable on Win10/11
+        try
+        {
+            var shellType = Type.GetTypeFromProgID("Shell.Application");
+            if (shellType is not null)
+            {
+                dynamic shell = Activator.CreateInstance(shellType)!;
+                dynamic folder = shell.NameSpace(0x0a); // ssfBITBUCKET
+                if (folder is not null)
+                {
+                    dynamic items = folder.Items();
+                    if (items is not null)
+                        return (int)items.Count > 0;
+                }
+            }
+        }
+        catch { /* fall through */ }
+
+        try
+        {
+            var info = new NativeMethods.SHQUERYRBINFO
+            {
+                cbSize = Marshal.SizeOf<NativeMethods.SHQUERYRBINFO>()
+            };
+            if (NativeMethods.SHQueryRecycleBin(null, ref info) == 0)
+                return info.i64NumItems > 0;
+        }
+        catch { /* ignore */ }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Returns true if the recycle bin empty/full state changed since the last check.
+    /// Callers should refresh recycle-bin tiles when this returns true.
+    /// </summary>
+    public bool CheckRecycleBinStateChanged()
+    {
+        var full = IsRecycleBinFull();
+        if (_lastRecycleBinFull == full) return false;
+        _lastRecycleBinFull = full;
+        // Drop cached recycle-bin images so the next GetItemImage loads the correct artwork
+        foreach (var key in _cache.Keys.Where(IsRecycleBinCacheKey).ToList())
+            _cache.Remove(key);
+        return true;
+    }
+
+    private static bool IsRecycleBinCacheKey(string key) =>
+        key.Contains("645FF040", StringComparison.OrdinalIgnoreCase) ||
+        key.Contains("RecycleBin", StringComparison.OrdinalIgnoreCase) ||
+        key.Contains("|rb:", StringComparison.OrdinalIgnoreCase);
+
     public string GetDisplayLabel(string path)
     {
         if (string.IsNullOrWhiteSpace(path)) return "Item";
@@ -82,7 +139,10 @@ public sealed class IconService
     {
         var sz = size ?? _iconSize;
         var iconPath = _desktopIcons.ResolveItemPath(path);
-        var key = $"{sz}|{path}|{iconPath}";
+        var rbTag = DesktopIconService.IsRecycleBinPath(path) || DesktopIconService.IsRecycleBinPath(iconPath)
+            ? (IsRecycleBinFull() ? "rb:full" : "rb:empty")
+            : "";
+        var key = $"{sz}|{path}|{iconPath}|{rbTag}";
         if (_cache.TryGetValue(key, out var cached))
             return cached;
 
@@ -110,9 +170,7 @@ public sealed class IconService
             if (fromLnk is not null) return fromLnk;
         }
 
-        if (DesktopIconService.IsShellNamespacePath(path) ||
-            path.Contains("645FF040", StringComparison.OrdinalIgnoreCase) ||
-            path.Contains("RecycleBin", StringComparison.OrdinalIgnoreCase))
+        if (DesktopIconService.IsRecycleBinPath(path))
         {
             var rb = GetRecycleBinIcon(size);
             if (rb is not null) return rb;
@@ -209,7 +267,11 @@ public sealed class IconService
 
     private ImageSource? GetRecycleBinIcon(int size)
     {
-        // 1) Official stock icon (correct full/empty system artwork)
+        var full = IsRecycleBinFull();
+        var preferred = full ? NativeMethods.SIID_RECYCLERFULL : NativeMethods.SIID_RECYCLER;
+        var fallback = full ? NativeMethods.SIID_RECYCLER : NativeMethods.SIID_RECYCLERFULL;
+
+        // 1) Official stock icon chosen from live empty/full state
         try
         {
             var info = new NativeMethods.SHSTOCKICONINFO
@@ -218,8 +280,7 @@ public sealed class IconService
             };
             var flags = NativeMethods.SHGSI_ICON |
                         (size <= 16 ? NativeMethods.SHGSI_SMALLICON : NativeMethods.SHGSI_LARGEICON);
-            // Prefer empty bin; full bin as fallback
-            foreach (var id in new[] { NativeMethods.SIID_RECYCLER, NativeMethods.SIID_RECYCLERFULL })
+            foreach (var id in new[] { preferred, fallback })
             {
                 if (NativeMethods.SHGetStockIconInfo(id, flags, ref info) == 0 && info.hIcon != IntPtr.Zero)
                 {
@@ -234,16 +295,15 @@ public sealed class IconService
         }
         catch { /* ignore */ }
 
-        // 2) imageres.dll / shell32.dll known indices
+        // 2) imageres.dll / shell32.dll known indices (full ≈ 49, empty ≈ 50)
         try
         {
             var imageres = Path.Combine(Environment.SystemDirectory, "imageres.dll");
             var shell32 = Path.Combine(Environment.SystemDirectory, "shell32.dll");
-            foreach (var (file, idx) in new[]
-                     {
-                         (imageres, 50), (imageres, 49), (imageres, 51),
-                         (shell32, 31), (shell32, 32)
-                     })
+            var indices = full
+                ? new[] { (imageres, 49), (imageres, 51), (shell32, 32), (imageres, 50), (shell32, 31) }
+                : new[] { (imageres, 50), (imageres, 51), (shell32, 31), (imageres, 49), (shell32, 32) };
+            foreach (var (file, idx) in indices)
             {
                 if (!File.Exists(file)) continue;
                 var img = GetFromFileIndex(file, idx, size);
@@ -252,7 +312,7 @@ public sealed class IconService
         }
         catch { /* ignore */ }
 
-        // 3) Shell path
+        // 3) Shell namespace path
         return GetShellCore("::{645FF040-5081-101B-9F08-00AA002F954E}", size)
                ?? GetShellCore("shell:RecycleBinFolder", size);
     }

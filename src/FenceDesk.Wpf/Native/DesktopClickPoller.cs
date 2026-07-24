@@ -9,7 +9,7 @@ namespace FenceDesk.Native;
 /// No mouse hooks, no Raw Input, no SendMessage into Explorer.
 ///
 /// Distinguishing icon vs empty space without LVM_HITTEST:
-/// after a desktop-surface double-click we WAIT ~550ms; if focus moved to a
+/// after a desktop-surface double-click we WAIT briefly; if focus moved to a
 /// normal app / Explorer folder, we cancel (user opened an icon). If focus is
 /// still the desktop shell, we toggle fences.
 /// </summary>
@@ -17,7 +17,7 @@ internal sealed class DesktopClickPoller : IDisposable
 {
     private const int VK_LBUTTON = 0x01;
     /// <summary>How long to wait to see if an icon launch stole focus.</summary>
-    private const int DeferMs = 650;
+    private const int DeferMs = 220;
 
     private readonly DispatcherTimer _timer;
     private readonly Action _onDesktopDoubleClick;
@@ -41,9 +41,9 @@ internal sealed class DesktopClickPoller : IDisposable
     public DesktopClickPoller(Dispatcher dispatcher, Action onDesktopDoubleClick)
     {
         _onDesktopDoubleClick = onDesktopDoubleClick;
-        _timer = new DispatcherTimer(DispatcherPriority.Background, dispatcher)
+        _timer = new DispatcherTimer(DispatcherPriority.Input, dispatcher)
         {
-            Interval = TimeSpan.FromMilliseconds(20)
+            Interval = TimeSpan.FromMilliseconds(16)
         };
         _timer.Tick += OnTick;
     }
@@ -113,7 +113,7 @@ internal sealed class DesktopClickPoller : IDisposable
         _lastClickTick = 0;
 
         var since = now - _lastFireTick;
-        if (since >= 0 && since < 700) return; // hard debounce
+        if (since >= 0 && since < 350) return; // hard debounce
 
         // Class-name only — never touch Explorer list-view
         if (!DesktopHitTest.IsDesktopSurfaceAt(pt.X, pt.Y))

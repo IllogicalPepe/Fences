@@ -68,6 +68,16 @@ public sealed class DesktopIconService
 
     public static string RecycleBinPath => "::{645FF040-5081-101B-9F08-00AA002F954E}";
 
+    public static bool IsRecycleBinPath(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return false;
+        if (path.Contains("645FF040", StringComparison.OrdinalIgnoreCase)) return true;
+        if (path.Contains("RecycleBin", StringComparison.OrdinalIgnoreCase)) return true;
+        var clsid = GetShellClsid(path);
+        return clsid is not null &&
+               clsid.Equals("{645FF040-5081-101B-9F08-00AA002F954E}", StringComparison.OrdinalIgnoreCase);
+    }
+
     public string ResolveItemPath(string path)
     {
         if (string.IsNullOrWhiteSpace(path) || IsShellNamespacePath(path)) return path;

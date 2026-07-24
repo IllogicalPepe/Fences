@@ -14,9 +14,12 @@ public sealed class FenceManager
     private readonly PortalService _portals;
     private readonly Dictionary<string, FenceWindow> _windows = new();
     private DispatcherTimer? _showDesktopTimer;
+    private DispatcherTimer? _recycleBinTimer;
     private DesktopClickPoller? _clickPoller;
     private int _lastToggleTick;
     private bool _exiting;
+    private string? _lastWinDRepairLog;
+    private int _lastWinDRepairTick;
 
     public FenceManager(LayoutStore layout, IconService icons, DesktopIconService desktopIcons, PortalService portals)
     {
@@ -37,6 +40,10 @@ public sealed class FenceManager
 
     public void InitializeAll()
     {
+        // Clear leftover single-member groupIds so "Ungroup" / drag never stick forever
+        try { SanitizeOrphanGroups(); }
+        catch (Exception ex) { AppLog.Write("SanitizeOrphanGroups: " + ex.Message); }
+
         foreach (var model in _layout.Layout.Fences.ToList())
         {
             model.EnsureDefaults();
@@ -61,10 +68,12 @@ public sealed class FenceManager
         }
         else HideAll();
 
-        // Show-desktop guard can be re-enabled after stability is confirmed
-        // StartShowDesktopGuard();
+        // Keep fences visible after Win+D (topmost on desktop; under focused apps/games)
+        StartShowDesktopGuard();
 
         StartDesktopDoubleClickWatch();
+        StartRecycleBinIconWatch();
+        AppLog.Write($"Recycle Bin icon state: {(IconService.IsRecycleBinFull() ? "full" : "empty")}");
     }
 
     public FenceWindow CreateFenceWindow(FenceModel model)
@@ -115,6 +124,30 @@ public sealed class FenceManager
 
     public void RemoveFence(string id)
     {
+        // If this fence was in a group, drop its link first so leftovers don't stick
+        try
+        {
+            var before = _layout.FindFence(id);
+            var gid = before?.GroupId;
+            if (!string.IsNullOrWhiteSpace(gid))
+            {
+                // Clear this member, then dissolve if <2 remain
+                if (before is not null) before.GroupId = null;
+                var rest = GetFencesInGroup(gid).ToList();
+                if (rest.Count <= 1)
+                {
+                    foreach (var f in rest)
+                    {
+                        f.GroupId = null;
+                        _layout.UpdateFence(f);
+                        RefreshFenceGroupUi(f.Id);
+                    }
+                    _layout.Layout.Groups?.Remove(gid!);
+                }
+            }
+        }
+        catch { /* ignore */ }
+
         _portals.Unregister(id);
         if (_windows.TryGetValue(id, out var win))
         {
@@ -134,6 +167,12 @@ public sealed class FenceManager
         }
         // In-memory only during interactive toggle — disk write can hitch AV/DWM
         _layout.Layout.Settings.ShowFences = true;
+        var wantTop = DesktopPin.ShouldUseTopmost(DesktopPin.CurrentProcessId);
+        foreach (var w in _windows.Values)
+        {
+            try { w.ApplyDesktopChrome(useTopmost: wantTop); }
+            catch { /* ignore */ }
+        }
     }
 
     public void HideAll()
@@ -156,7 +195,7 @@ public sealed class FenceManager
         if (_lastToggleTick != 0)
         {
             var dt = now - _lastToggleTick;
-            if (dt > 0 && dt < 250)
+            if (dt > 0 && dt < 120)
                 return;
         }
         _lastToggleTick = now;
@@ -215,14 +254,25 @@ public sealed class FenceManager
     public IReadOnlyList<FenceModel> GetFencesInGroup(string? groupId)
     {
         if (string.IsNullOrWhiteSpace(groupId)) return Array.Empty<FenceModel>();
-        return _layout.Layout.Fences.Where(f => f.GroupId == groupId).ToList();
+        return _layout.Layout.Fences
+            .Where(f => string.Equals(f.GroupId, groupId, StringComparison.Ordinal))
+            .ToList();
+    }
+
+    /// <summary>True only when this fence shares a groupId with at least one other fence.</summary>
+    public bool IsEffectivelyGrouped(string fenceId)
+    {
+        var m = _layout.FindFence(fenceId);
+        if (m is null || string.IsNullOrWhiteSpace(m.GroupId)) return false;
+        return GetFencesInGroup(m.GroupId).Count >= 2;
     }
 
     public IReadOnlyList<FenceModel> GetLinkedFences(string fenceId)
     {
         var m = _layout.FindFence(fenceId);
         if (m is null) return Array.Empty<FenceModel>();
-        if (string.IsNullOrWhiteSpace(m.GroupId))
+        // Lone leftover groupIds should not act like a multi-fence group
+        if (!IsEffectivelyGrouped(fenceId))
             return new[] { m };
         return GetFencesInGroup(m.GroupId);
     }
@@ -234,8 +284,7 @@ public sealed class FenceManager
         {
             f.Locked = locked;
             _layout.UpdateFence(f);
-            if (_windows.TryGetValue(f.Id, out var w))
-                w.UpdateLockChrome();
+            RefreshFenceGroupUi(f.Id);
         }
     }
 
@@ -244,10 +293,18 @@ public sealed class FenceManager
         var a = _layout.FindFence(fenceId);
         var b = _layout.FindFence(targetFenceId);
         if (a is null || b is null) return;
+        if (a.Id == b.Id) return;
+
+        // Normalize any orphan single-member groups first so merge uses clean ids
+        SanitizeOrphanGroups();
+
+        a = _layout.FindFence(fenceId);
+        b = _layout.FindFence(targetFenceId);
+        if (a is null || b is null) return;
 
         var gid = !string.IsNullOrWhiteSpace(b.GroupId) ? b.GroupId
             : !string.IsNullOrWhiteSpace(a.GroupId) ? a.GroupId
-            : Guid.NewGuid().ToString();
+            : Guid.NewGuid().ToString("D");
 
         var merge = new Dictionary<string, FenceModel>(StringComparer.Ordinal);
         merge[a.Id] = a;
@@ -277,25 +334,71 @@ public sealed class FenceManager
             f.GroupId = gid;
             f.Locked = lockGroup;
             _layout.UpdateFence(f);
-            if (_windows.TryGetValue(f.Id, out var w))
-                w.UpdateLockChrome();
         }
         if (!string.IsNullOrWhiteSpace(existingName))
             groups[gid!] = existingName!;
-        _layout.Save();
-        AppLog.Write($"Merged group [{string.Join(", ", merge.Values.Select(f => f.Title))}] locked={lockGroup}");
+        _layout.SaveImmediate();
+        foreach (var f in merge.Values)
+            RefreshFenceGroupUi(f.Id);
+        AppLog.Write($"Merged group [{string.Join(", ", merge.Values.Select(f => f.Title))}] id={gid} locked={lockGroup}");
     }
 
+    /// <summary>Detach one fence from its group. Remaining members stay linked (if 2+).</summary>
     public void LeaveFenceGroup(string fenceId)
     {
         var m = _layout.FindFence(fenceId);
         if (m is null) return;
         var gid = m.GroupId;
+        if (string.IsNullOrWhiteSpace(gid))
+        {
+            RefreshFenceGroupUi(fenceId);
+            return;
+        }
+
+        // Capture siblings BEFORE clearing so we can refresh their UI
+        var siblings = GetFencesInGroup(gid).Select(f => f.Id).ToList();
+
         m.GroupId = null;
         _layout.UpdateFence(m);
-        if (_windows.TryGetValue(fenceId, out var w))
-            w.UpdateLockChrome();
-        CleanupEmptyGroup(gid);
+        AppLog.Write($"Ungrouped fence '{m.Title}' ({fenceId}) from group {gid}");
+
+        // If only one fence would remain, dissolve the leftover group entirely
+        var remaining = GetFencesInGroup(gid);
+        if (remaining.Count <= 1)
+        {
+            foreach (var f in remaining)
+            {
+                f.GroupId = null;
+                _layout.UpdateFence(f);
+                AppLog.Write($"Auto-dissolved leftover group member '{f.Title}'");
+            }
+            _layout.Layout.Groups?.Remove(gid);
+        }
+
+        _layout.SaveImmediate();
+
+        // Refresh every fence that was in the group (leaver + remaining)
+        foreach (var id in siblings.Distinct(StringComparer.Ordinal))
+            RefreshFenceGroupUi(id);
+    }
+
+    /// <summary>Detach every fence in the group (full dissolve).</summary>
+    public void DissolveFenceGroup(string fenceId)
+    {
+        var m = _layout.FindFence(fenceId);
+        if (m is null || string.IsNullOrWhiteSpace(m.GroupId)) return;
+        var gid = m.GroupId!;
+        var members = GetFencesInGroup(gid).Select(f => f.Id).ToList();
+        foreach (var f in GetFencesInGroup(gid))
+        {
+            f.GroupId = null;
+            _layout.UpdateFence(f);
+        }
+        _layout.Layout.Groups?.Remove(gid);
+        _layout.SaveImmediate();
+        AppLog.Write($"Dissolved group {gid} ({members.Count} fences)");
+        foreach (var id in members)
+            RefreshFenceGroupUi(id);
     }
 
     public string GetGroupName(string? groupId)
@@ -315,26 +418,68 @@ public sealed class FenceManager
             groups.Remove(groupId);
         else
             groups[groupId] = name.Trim();
-        _layout.Save();
+        _layout.SaveImmediate();
         foreach (var f in GetFencesInGroup(groupId))
-        {
-            if (_windows.TryGetValue(f.Id, out var w))
-                w.UpdateLockChrome();
-        }
+            RefreshFenceGroupUi(f.Id);
     }
 
-    private void CleanupEmptyGroup(string? groupId)
+    /// <summary>Clear groupIds that no longer link 2+ fences (orphans / bad state).</summary>
+    public void SanitizeOrphanGroups()
     {
-        if (string.IsNullOrWhiteSpace(groupId)) return;
-        if (GetFencesInGroup(groupId).Count > 0) return;
-        _layout.Layout.Groups?.Remove(groupId);
-        _layout.Save();
+        var changed = false;
+        var byGroup = _layout.Layout.Fences
+            .Where(f => !string.IsNullOrWhiteSpace(f.GroupId))
+            .GroupBy(f => f.GroupId!, StringComparer.Ordinal);
+
+        foreach (var g in byGroup)
+        {
+            if (g.Count() >= 2) continue;
+            foreach (var f in g)
+            {
+                f.GroupId = null;
+                changed = true;
+                AppLog.Write($"Cleared orphan groupId on '{f.Title}'");
+            }
+            _layout.Layout.Groups?.Remove(g.Key);
+        }
+
+        // Drop name entries with no members
+        if (_layout.Layout.Groups is not null)
+        {
+            var live = new HashSet<string>(
+                _layout.Layout.Fences
+                    .Where(f => !string.IsNullOrWhiteSpace(f.GroupId))
+                    .Select(f => f.GroupId!),
+                StringComparer.Ordinal);
+            foreach (var key in _layout.Layout.Groups.Keys.ToList())
+            {
+                if (live.Contains(key)) continue;
+                _layout.Layout.Groups.Remove(key);
+                changed = true;
+            }
+        }
+
+        if (changed) _layout.SaveImmediate();
+    }
+
+    private void RefreshFenceGroupUi(string fenceId)
+    {
+        if (!_windows.TryGetValue(fenceId, out var w)) return;
+        try
+        {
+            w.UpdateLockChrome();
+            w.RebuildContextMenu();
+        }
+        catch (Exception ex)
+        {
+            AppLog.Write($"RefreshFenceGroupUi({fenceId}): {ex.Message}");
+        }
     }
 
     public void MatchGroupSize(string fenceId)
     {
         var m = _layout.FindFence(fenceId);
-        if (m is null || string.IsNullOrWhiteSpace(m.GroupId)) return;
+        if (m is null || !IsEffectivelyGrouped(fenceId)) return;
         var w = Math.Max(140, m.Width);
         var h = Math.Max(80, m.Height);
         foreach (var f in GetFencesInGroup(m.GroupId))
@@ -345,13 +490,14 @@ public sealed class FenceManager
             if (_windows.TryGetValue(f.Id, out var win))
                 win.ApplySizeFromModel();
         }
-        // After uniform size, push members apart so they no longer stack on top of each other
-        ArrangeGroupNoOverlap(m.GroupId, preferAnchorId: fenceId);
+        // After uniform size, push members apart along the group's natural axis
+        ArrangeGroupNoOverlap(m.GroupId!, preferAnchorId: fenceId);
     }
 
     /// <summary>
     /// Repositions group members so none overlap, keeping the anchor fence fixed.
-    /// Others slide right, then below, until clear (with a small gap).
+    /// Detects vertical stacks vs horizontal rows and slides along that axis first
+    /// (avoids shoving the middle fence off to the right when fences are stacked).
     /// </summary>
     public void ArrangeGroupNoOverlap(string groupId, string? preferAnchorId = null, double gap = 14)
     {
@@ -373,19 +519,25 @@ public sealed class FenceManager
             entries.Add((f.Id, x, y, Math.Max(140, ww), Math.Max(32, hh), f.Locked));
         }
 
+        // Prefer vertical stack when members share roughly the same X (column layout)
+        var xSpan = entries.Max(e => e.X) - entries.Min(e => e.X);
+        var ySpan = entries.Max(e => e.Y) - entries.Min(e => e.Y);
+        var avgW = entries.Average(e => e.W);
+        // Column if X variance is small relative to width, or Y spread dominates
+        var preferVertical = xSpan < avgW * 0.55 || ySpan >= xSpan;
+
         // Anchor stays put (the fence that initiated match-size, or top-left-most)
         var anchorId = preferAnchorId is not null && entries.Any(e => e.Id == preferAnchorId)
             ? preferAnchorId
             : entries.OrderBy(e => e.Y).ThenBy(e => e.X).First().Id;
 
-        var ordered = entries
-            .OrderBy(e => e.Id == anchorId ? 0 : 1)
-            .ThenBy(e => e.Y)
-            .ThenBy(e => e.X)
-            .ToList();
+        var ordered = preferVertical
+            ? entries.OrderBy(e => e.Id == anchorId ? 0 : 1).ThenBy(e => e.Y).ThenBy(e => e.X).ToList()
+            : entries.OrderBy(e => e.Id == anchorId ? 0 : 1).ThenBy(e => e.X).ThenBy(e => e.Y).ToList();
 
         var placed = new List<(string Id, double X, double Y, double W, double H)>();
         var minX = entries.Min(e => e.X);
+        var minY = entries.Min(e => e.Y);
         var maxRight = System.Windows.Forms.SystemInformation.VirtualScreen.Right - 40.0;
         var maxBottom = System.Windows.Forms.SystemInformation.VirtualScreen.Bottom - 40.0;
         var minScreenX = (double)System.Windows.Forms.SystemInformation.VirtualScreen.Left;
@@ -415,19 +567,40 @@ public sealed class FenceManager
                         Overlaps(x, y, e.W, e.H, p.X, p.Y, p.W, p.H, gap));
                     if (hit.Id is null) break;
 
-                    // Prefer sliding to the right of the conflict
-                    var rightOf = hit.X + hit.W + gap;
-                    if (rightOf + e.W <= maxRight)
+                    if (preferVertical)
                     {
-                        x = rightOf;
-                        continue;
+                        // Column stack: keep X, slide below the conflict
+                        x = hit.X; // align with conflict column
+                        y = hit.Y + hit.H + gap;
+                        if (y + e.H > maxBottom)
+                        {
+                            // Fall back to the right only if we ran out of vertical room
+                            var rightOf = hit.X + hit.W + gap;
+                            if (rightOf + e.W <= maxRight)
+                            {
+                                x = rightOf;
+                                y = Math.Max(minY, minScreenY);
+                                continue;
+                            }
+                            y = Math.Max(minScreenY, hit.Y);
+                        }
                     }
-
-                    // Wrap: align under the conflict (or under the pack), keep left of group
-                    x = Math.Max(minX, minScreenX);
-                    y = Math.Max(y, hit.Y + hit.H + gap);
-                    if (y + e.H > maxBottom)
-                        y = Math.Max(minScreenY, hit.Y); // clamp; still better than infinite loop
+                    else
+                    {
+                        // Row layout: slide to the right of the conflict
+                        var rightOf = hit.X + hit.W + gap;
+                        if (rightOf + e.W <= maxRight)
+                        {
+                            x = rightOf;
+                            y = hit.Y;
+                            continue;
+                        }
+                        // Wrap under the pack
+                        x = Math.Max(minX, minScreenX);
+                        y = Math.Max(y, hit.Y + hit.H + gap);
+                        if (y + e.H > maxBottom)
+                            y = Math.Max(minScreenY, hit.Y);
+                    }
                 }
             }
 
@@ -440,27 +613,15 @@ public sealed class FenceManager
             _layout.UpdateFence(model);
             if (_windows.TryGetValue(e.Id, out var win) && !win.ToggleHidden)
             {
-                // Only move unlocked non-anchor (anchor already correct; locked stay)
-                if (e.Id == anchorId || e.Locked)
-                {
-                    // Still sync model; window may already be there
-                    if (Math.Abs(win.Left - x) > 0.5 || Math.Abs(win.Top - y) > 0.5)
-                    {
-                        if (!e.Locked)
-                        {
-                            win.Left = x;
-                            win.Top = y;
-                        }
-                    }
-                }
-                else
+                if (e.Locked) continue;
+                if (Math.Abs(win.Left - x) > 0.5 || Math.Abs(win.Top - y) > 0.5)
                 {
                     win.Left = x;
                     win.Top = y;
                 }
             }
         }
-        _layout.Save();
+        _layout.SaveImmediate();
     }
 
     /// <summary>Magnetic snap of Left/Top against other visible fences.</summary>
@@ -542,9 +703,9 @@ public sealed class FenceManager
             if (f.Id == excludeId) continue;
             if (GetLinkedFences(excludeId).Any(x => x.Id == f.Id)) continue;
 
-            if (!string.IsNullOrWhiteSpace(f.GroupId))
+            if (IsEffectivelyGrouped(f.Id))
             {
-                if (!seenGroups.Add(f.GroupId)) continue;
+                if (!seenGroups.Add(f.GroupId!)) continue;
                 var gName = GetGroupName(f.GroupId);
                 var titles = GetFencesInGroup(f.GroupId).Select(x => x.Title).Where(t => !string.IsNullOrWhiteSpace(t));
                 var label = string.IsNullOrWhiteSpace(gName)
@@ -683,14 +844,40 @@ public sealed class FenceManager
         _exiting = true;
         try { StopDesktopDoubleClickWatch(); } catch { /* ignore */ }
         try { StopShowDesktopGuard(); } catch { /* ignore */ }
+        try { StopRecycleBinIconWatch(); } catch { /* ignore */ }
         try { _layout.SaveImmediate(); } catch { /* ignore */ }
         try { CloseAll(); } catch { /* ignore */ }
         Exiting?.Invoke(this, EventArgs.Empty);
     }
 
+    private void StartRecycleBinIconWatch()
+    {
+        _recycleBinTimer?.Stop();
+        _recycleBinTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
+        _recycleBinTimer.Tick += (_, _) =>
+        {
+            if (_exiting) return;
+            try
+            {
+                if (!_icons.CheckRecycleBinStateChanged()) return;
+                foreach (var w in _windows.Values)
+                    w.RefreshRecycleBinIcons();
+            }
+            catch (Exception ex) { AppLog.Write("RecycleBin watch: " + ex.Message); }
+        };
+        _recycleBinTimer.Start();
+    }
+
+    private void StopRecycleBinIconWatch()
+    {
+        _recycleBinTimer?.Stop();
+        _recycleBinTimer = null;
+    }
+
     private void StartShowDesktopGuard()
     {
-        _showDesktopTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
+        _showDesktopTimer?.Stop();
+        _showDesktopTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(200) };
         _showDesktopTimer.Tick += (_, _) => RestoreAfterShowDesktop();
         _showDesktopTimer.Start();
         AppLog.Write("Fence Win+D guard started (smart z-order)");
@@ -714,9 +901,33 @@ public sealed class FenceManager
             {
                 var hwnd = w.GetHwnd();
                 var needs = !w.IsVisible || w.WindowState == WindowState.Minimized;
-                if (hwnd != IntPtr.Zero && DesktopPin.NeedsShowDesktopRepair(hwnd)) needs = true;
-                if (needs || w.Topmost != wantTop)
+                if (hwnd != IntPtr.Zero)
+                {
+                    if (DesktopPin.NeedsShowDesktopRepair(hwnd))
+                        needs = true;
+                    // Win+D often strips TOPMOST without minimizing — re-pin when bit is gone
+                    if (wantTop && !NativeMethods.IsWindowTopmost(hwnd))
+                        needs = true;
+                    if (!wantTop && NativeMethods.IsWindowTopmost(hwnd))
+                        needs = true;
+                }
+                if (needs || w.IsPinnedTopmost != wantTop)
+                {
                     w.ApplyDesktopChrome(useTopmost: wantTop);
+                    if (wantTop && needs)
+                    {
+                        var msg = DesktopPin.LastDebug;
+                        var now = Environment.TickCount;
+                        if (!string.Equals(msg, _lastWinDRepairLog, StringComparison.Ordinal) ||
+                            now - _lastWinDRepairTick > 2000 ||
+                            _lastWinDRepairTick == 0)
+                        {
+                            _lastWinDRepairLog = msg;
+                            _lastWinDRepairTick = now;
+                            AppLog.Write("Win+D repair → " + msg);
+                        }
+                    }
+                }
             }
             catch { /* ignore */ }
         }
@@ -754,16 +965,24 @@ public sealed class FenceManager
         var tab = model.GetActiveTab();
         if (tab is null) return;
         var existing = new HashSet<string>(tab.Items.Select(i => i.Path), StringComparer.OrdinalIgnoreCase);
+        // Also treat alternate shell forms of the same CLSID as duplicates
+        foreach (var it in tab.Items)
+        {
+            var c = DesktopIconService.GetShellClsid(it.Path);
+            if (c is not null) existing.Add(c);
+        }
+
         foreach (var p in paths)
         {
             if (string.IsNullOrWhiteSpace(p)) continue;
-            var norm = p;
-            if (p.Contains("Recycle", StringComparison.OrdinalIgnoreCase) ||
-                p.Contains("645FF040", StringComparison.OrdinalIgnoreCase))
-                norm = DesktopIconService.RecycleBinPath;
+            var norm = Native.ShellIdListDrop.NormalizeShellPath(p);
+            var clsid = DesktopIconService.GetShellClsid(norm);
             if (existing.Contains(norm)) continue;
+            if (clsid is not null && existing.Contains(clsid)) continue;
             tab.Items.Add(new FenceItem { Path = norm, Label = _icons.GetDisplayLabel(norm) });
             existing.Add(norm);
+            if (clsid is not null) existing.Add(clsid);
+            AppLog.Write($"Added fence item: {norm}");
         }
         _layout.UpdateFence(model);
         if (_windows.TryGetValue(fenceId, out var w)) w.RefreshContent();
@@ -772,6 +991,35 @@ public sealed class FenceManager
 
     public void RemoveItem(string fenceId, string path) =>
         RemoveItems(fenceId, new[] { path });
+
+    /// <summary>
+    /// Move existing items within the active tab. insertIndex is among the items
+    /// that are NOT being dragged (0 = before first remaining, Count = after last).
+    /// </summary>
+    public void ReorderItems(string fenceId, IReadOnlyList<string> draggedPaths, int insertIndex)
+    {
+        var model = _layout.FindFence(fenceId);
+        if (model is null || model.IsPortal) return;
+        var tab = model.GetActiveTab();
+        if (tab is null) return;
+
+        var dragSet = new HashSet<string>(
+            draggedPaths.Where(p => !string.IsNullOrWhiteSpace(p)),
+            StringComparer.OrdinalIgnoreCase);
+        if (dragSet.Count == 0) return;
+
+        var moving = tab.Items.Where(i => dragSet.Contains(i.Path)).ToList();
+        if (moving.Count == 0) return;
+        var remaining = tab.Items.Where(i => !dragSet.Contains(i.Path)).ToList();
+        insertIndex = Math.Clamp(insertIndex, 0, remaining.Count);
+        remaining.InsertRange(insertIndex, moving);
+
+        tab.Items.Clear();
+        tab.Items.AddRange(remaining);
+        _layout.UpdateFence(model);
+        if (_windows.TryGetValue(fenceId, out var w)) w.RefreshContent();
+        AppLog.Write($"ReorderItems: {moving.Count} item(s) → index {insertIndex} in {model.Title}");
+    }
 
     public void RemoveItems(string fenceId, IEnumerable<string> paths)
     {

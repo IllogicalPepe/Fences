@@ -12,8 +12,12 @@ internal static class NativeMethods
     public const int WS_EX_NOACTIVATE = 0x08000000;
     public const int WS_EX_LAYERED = 0x00080000;
     public const int WS_EX_TRANSPARENT = 0x00000020; // click-through
+    public const int WS_EX_TOPMOST = 0x00000008;
     public const int WS_CHILD = 0x40000000;
     public const int WS_DISABLED = 0x08000000;
+    public const int WS_MINIMIZE = 0x20000000;
+
+    public const int DWMWA_CLOAKED = 14;
 
     public const uint LWA_ALPHA = 0x2;
 
@@ -59,6 +63,18 @@ internal static class NativeMethods
     public const int SIID_RECYCLER = 31;
     public const int SIID_RECYCLERFULL = 32;
 
+    // Must be 24 bytes on x64 (DWORD + pad + two LONGLONGs). Pack=4 yields 20 and SHQueryRecycleBin returns E_INVALIDARG.
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SHQUERYRBINFO
+    {
+        public int cbSize;
+        public long i64Size;
+        public long i64NumItems;
+    }
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    public static extern int SHQueryRecycleBin(string? pszRootPath, ref SHQUERYRBINFO pSHQueryRBInfo);
+
     public const uint MONITOR_DEFAULTTONEAREST = 2;
     public const uint GA_ROOT = 2;
     public const uint GW_OWNER = 4;
@@ -81,6 +97,32 @@ internal static class NativeMethods
 
     [DllImport("user32.dll")]
     public static extern bool IsZoomed(IntPtr hWnd);
+
+    [DllImport("dwmapi.dll")]
+    public static extern int DwmGetWindowAttribute(IntPtr hwnd, int dwAttribute, out int pvAttribute, int cbAttribute);
+
+    public static bool IsCloaked(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero) return false;
+        try
+        {
+            if (DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, out var cloaked, sizeof(int)) != 0)
+                return false;
+            return cloaked != 0;
+        }
+        catch { return false; }
+    }
+
+    public static bool IsWindowTopmost(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero) return false;
+        try
+        {
+            var ex = GetWindowLong(hwnd, GWL_EXSTYLE);
+            return (ex & WS_EX_TOPMOST) != 0;
+        }
+        catch { return false; }
+    }
 
     [DllImport("user32.dll")]
     public static extern IntPtr GetForegroundWindow();
