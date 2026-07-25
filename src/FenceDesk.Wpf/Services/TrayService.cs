@@ -19,25 +19,28 @@ public sealed class TrayService : IDisposable
     {
         var menu = new ContextMenuStrip();
         menu.Items.Add("New fence", null, (_, _) => Safe(() => _manager.NewFenceFromTray()));
-        menu.Items.Add("New portal fence...", null, (_, _) => Safe(() =>
+        menu.Items.Add("New portal fence…", null, (_, _) => Safe(() =>
         {
             var folder = FenceManager.PickFolder("Select folder for new portal fence");
             if (folder is not null) _manager.NewPortalFence(folder);
         }));
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("Show fences", null, (_, _) => Safe(_manager.ShowAll));
-        menu.Items.Add("Hide fences", null, (_, _) => Safe(_manager.HideAll));
-        menu.Items.Add("Bring fences to front", null, (_, _) => Safe(_manager.BringToFront));
-        menu.Items.Add("Lock all fences", null, (_, _) => Safe(() => _manager.SetAllLocked(true)));
-        menu.Items.Add("Unlock all fences", null, (_, _) => Safe(() => _manager.SetAllLocked(false)));
-        menu.Items.Add("Background color (all fences)...", null, (_, _) => Safe(() =>
-        {
-            var seed = _manager.LayoutStore.Layout.Fences.FirstOrDefault()?.BgColor ?? "#0F1724";
-            var c = FenceManager.PickColor(seed);
-            if (c is not null)
-                _manager.SetAllBackgroundColor(FenceManager.ToHex(c.Value.R, c.Value.G, c.Value.B));
-        }));
-        menu.Items.Add("Reset all fence colors (bg + text)", null, (_, _) => Safe(_manager.ResetAllFenceColors));
+        var visibility = new ToolStripMenuItem("Visibility");
+        visibility.DropDownItems.Add("Show fences", null, (_, _) => Safe(_manager.BringToFront));
+        visibility.DropDownItems.Add("Hide fences", null, (_, _) => Safe(_manager.HideAll));
+        menu.Items.Add(visibility);
+        menu.Items.Add(new ToolStripSeparator());
+
+        var appearance = new ToolStripMenuItem("Appearance");
+        appearance.DropDownItems.Add("Appearance…", null, (_, _) => Safe(() => _manager.ShowAppearanceEditor(applyToAllByDefault: true)));
+        appearance.DropDownItems.Add("Reset colors", null, (_, _) => Safe(_manager.ResetAllFenceColors));
+        menu.Items.Add(appearance);
+
+        var locking = new ToolStripMenuItem("Locking");
+        locking.DropDownItems.Add("Lock all", null, (_, _) => Safe(() => _manager.SetAllLocked(true)));
+        locking.DropDownItems.Add("Unlock all", null, (_, _) => Safe(() => _manager.SetAllLocked(false)));
+        menu.Items.Add(locking);
+
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Open config folder", null, (_, _) => Safe(() =>
         {
@@ -62,16 +65,8 @@ public sealed class TrayService : IDisposable
             catch { /* ignore */ }
         };
         menu.Items.Add(autostart);
-        menu.Items.Add("About FenceDesk", null, (_, _) =>
-        {
-            System.Windows.Forms.MessageBox.Show(
-                "FenceDesk — desktop fence organizer\nC# + WPF port.\n\n" +
-                "Right-click a fence for options.\nDrop files onto fences.\n" +
-                "Left-click this tray icon for the control panel.",
-                "FenceDesk", MessageBoxButtons.OK, MessageBoxIcon.Information);
-        });
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("Exit (close completely)", null, (_, _) => Safe(_manager.ExitApplication));
+        menu.Items.Add("Exit", null, (_, _) => Safe(_manager.ExitApplication));
 
         _notify = new NotifyIcon
         {
@@ -85,7 +80,6 @@ public sealed class TrayService : IDisposable
             if (e.Button == MouseButtons.Left)
                 Safe(_showControlPanel);
         };
-
     }
 
     private static Icon LoadIcon()

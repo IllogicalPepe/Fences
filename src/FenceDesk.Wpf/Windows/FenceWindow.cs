@@ -726,20 +726,13 @@ public sealed class FenceWindow : Window
     {
         try
         {
-            // Prefer live _model fields (opacity dialog previews before save).
-            // Only pull missing/stale non-appearance state from the store.
+            // Always prefer the store model when refs diverge. Bulk updates
+            // (SetAllBackgroundColor etc.) write the store first; preserving
+            // stale window appearance would clobber those changes.
+            // Opacity dialog live-previews write through to the store object.
             var stored = _manager.LayoutStore.FindFence(_model.Id);
-            if (stored is not null && !ReferenceEquals(stored, _model))
-            {
-                // Keep appearance values currently on _model (may be mid-edit)
-                var op = _model.Opacity;
-                var bg = _model.BgColor;
-                var tc = _model.TextColor;
+            if (stored is not null)
                 _model = stored;
-                _model.Opacity = op;
-                _model.BgColor = bg;
-                _model.TextColor = tc;
-            }
 
             var rgb = FenceManager.ParseHex(
                 string.IsNullOrWhiteSpace(_model.BgColor) ? DefaultBgColor : _model.BgColor);
@@ -811,6 +804,27 @@ public sealed class FenceWindow : Window
         {
             AppLog.Write($"ApplyGlassAppearance: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Push appearance onto this window from the store (after a bulk update).
+    /// Optional overrides force values onto the store model before painting.
+    /// </summary>
+    public void ApplyAppearanceFromStore(string? bgColor, string? textColor, double? opacity, bool persist = true)
+    {
+        var stored = _manager.LayoutStore.FindFence(_model.Id);
+        if (stored is not null)
+            _model = stored;
+
+        if (bgColor is not null) _model.BgColor = bgColor;
+        if (textColor is not null) _model.TextColor = textColor;
+        if (opacity is not null) _model.Opacity = opacity.Value;
+
+        if (persist)
+            _manager.LayoutStore.UpdateFence(_model);
+        ApplyGlassAppearance();
+        if (textColor is not null)
+            RefreshContent();
     }
 
     /// <summary>
@@ -1550,18 +1564,28 @@ public sealed class FenceWindow : Window
         // Always rebuild from live model so group/ungroup state is current
         _model = _manager.LayoutStore.FindFence(_model.Id) ?? _model;
 
+        // Use default system menu chrome — partial custom colors leave
+        // submenu/hover panels white with light text (unreadable).
         var cm = new ContextMenu();
-        void Add(string header, Action action)
+
+        void Add(string header, Action action, ItemCollection? into = null)
         {
             var mi = new MenuItem { Header = header };
             mi.Click += (_, _) =>
             {
                 try { action(); } catch (Exception ex) { AppLog.Write(ex.Message); }
             };
-            cm.Items.Add(mi);
+            (into ?? cm.Items).Add(mi);
         }
 
-        Add("Rename fence...", () =>
+        MenuItem Sub(string header)
+        {
+            var mi = new MenuItem { Header = header };
+            cm.Items.Add(mi);
+            return mi;
+        }
+
+        Add("Rename…", () =>
         {
             var name = FenceManager.PromptText("Rename fence", "Fence name:", _model.Title);
             if (string.IsNullOrWhiteSpace(name)) return;
@@ -1569,80 +1593,63 @@ public sealed class FenceWindow : Window
             _manager.LayoutStore.UpdateFence(_model);
             RefreshContent();
         });
-        Add("Roll up / expand", ToggleRollUp);
-        Add("Add tab...", () =>
-        {
-            if (_model.IsPortal)
-            {
-                MessageBox.Show("Tabs are not available on portal fences.", "FenceDesk");
-                return;
-            }
-            var name = FenceManager.PromptText("Add tab", "Tab name:", "New tab");
-            if (string.IsNullOrWhiteSpace(name)) return;
-            var tid = Guid.NewGuid().ToString();
-            _model.Tabs.Add(new FenceTab { Id = tid, Title = name.Trim() });
-            _model.ActiveTabId = tid;
-            _manager.LayoutStore.UpdateFence(_model);
-            RefreshContent();
-            BuildContextMenu();
-        });
-        if (!_model.IsPortal && _model.Tabs.Count > 1)
-        {
-            Add("Delete current tab…", () => DeleteTab(_model.ActiveTabId));
-        }
-        cm.Items.Add(new Separator());
-        Add("New fence", () => _manager.NewFenceFromTray());
-        Add("Convert to portal (folder view)...", () =>
-        {
-            var folder = FenceManager.PickFolder("Select folder for portal");
-            if (folder is null) return;
-            _model.Mode = "portal";
-            _model.PortalPath = folder;
-            _model.Title = Path.GetFileName(folder);
-            if (string.IsNullOrWhiteSpace(_model.Title)) _model.Title = folder;
-            _manager.LayoutStore.UpdateFence(_model);
-            _manager.Portals.Register(_model.Id, folder, id =>
-            {
-                if (_manager.Windows.TryGetValue(id, out var w)) w.RefreshContent();
-            });
-            RefreshContent();
-            _manager.DesktopIcons.SyncVisibility();
-        });
-        Add("Convert to items (manual list)", () =>
-        {
-            _manager.Portals.Unregister(_model.Id);
-            _model.Mode = "items";
-            _model.PortalPath = null;
-            _manager.LayoutStore.UpdateFence(_model);
-            RefreshContent();
-            _manager.DesktopIcons.SyncVisibility();
-        });
-        cm.Items.Add(new Separator());
-        Add("Background color...", () =>
-        {
-            var c = FenceManager.PickColor(_model.BgColor);
-            if (c is null) return;
-            _model.BgColor = FenceManager.ToHex(c.Value.R, c.Value.G, c.Value.B);
-            _manager.LayoutStore.UpdateFence(_model);
-            ApplyGlassAppearance();
-        });
-        Add("Text color...", () =>
-        {
-            var c = FenceManager.PickColor(
-                string.IsNullOrWhiteSpace(_model.TextColor) ? DefaultTextColor : _model.TextColor);
-            if (c is null) return;
-            _model.TextColor = FenceManager.ToHex(c.Value.R, c.Value.G, c.Value.B);
-            _manager.LayoutStore.UpdateFence(_model);
-            ApplyGlassAppearance();
-            RefreshContent(); // rebuild tiles with new label color
-        });
-        Add("Reset colors (background + text)", ResetColorsToDefault);
-        Add("Opacity...", ShowOpacityDialog);
+        Add(_model.RolledUp ? "Expand" : "Roll up", ToggleRollUp);
+
         if (!_model.IsPortal)
         {
-            cm.Items.Add(new Separator());
-            // Virtual desktop icons can't always be dragged on Win11 — offer explicit add
-            var shellMenu = new MenuItem { Header = "Add desktop icon…" };
+            var tabs = Sub("Tabs");
+            Add("Add tab…", () =>
+            {
+                var name = FenceManager.PromptText("Add tab", "Tab name:", "New tab");
+                if (string.IsNullOrWhiteSpace(name)) return;
+                var tid = Guid.NewGuid().ToString();
+                _model.Tabs.Add(new FenceTab { Id = tid, Title = name.Trim() });
+                _model.ActiveTabId = tid;
+                _manager.LayoutStore.UpdateFence(_model);
+                RefreshContent();
+                BuildContextMenu();
+            }, tabs.Items);
+            if (_model.Tabs.Count > 1)
+            {
+                Add("Delete current tab…", () => DeleteTab(_model.ActiveTabId), tabs.Items);
+            }
+        }
+
+        cm.Items.Add(new Separator());
+        Add("Appearance…", () => ShowAppearanceDialog());
+
+        if (_model.IsPortal)
+        {
+            Add("Convert to items", () =>
+            {
+                _manager.Portals.Unregister(_model.Id);
+                _model.Mode = "items";
+                _model.PortalPath = null;
+                _manager.LayoutStore.UpdateFence(_model);
+                RefreshContent();
+                _manager.DesktopIcons.SyncVisibility();
+            });
+        }
+        else
+        {
+            Add("Convert to portal…", () =>
+            {
+                var folder = FenceManager.PickFolder("Select folder for portal");
+                if (folder is null) return;
+                _model.Mode = "portal";
+                _model.PortalPath = folder;
+                _model.Title = Path.GetFileName(folder);
+                if (string.IsNullOrWhiteSpace(_model.Title)) _model.Title = folder;
+                _manager.LayoutStore.UpdateFence(_model);
+                _manager.Portals.Register(_model.Id, folder, id =>
+                {
+                    if (_manager.Windows.TryGetValue(id, out var w)) w.RefreshContent();
+                });
+                RefreshContent();
+                _manager.DesktopIcons.SyncVisibility();
+            });
+
+            var shellMenu = Sub("Add desktop icon");
             foreach (var kv in DesktopIconService.ShellDesktopIcons.OrderBy(k => k.Value.Name))
             {
                 var info = kv.Value;
@@ -1655,20 +1662,23 @@ public sealed class FenceWindow : Window
                 };
                 shellMenu.Items.Add(mi);
             }
-            cm.Items.Add(shellMenu);
         }
+
         cm.Items.Add(new Separator());
         Add(_model.Locked ? "Unlock position" : "Lock position", () =>
         {
             _manager.SetFenceLocked(_model.Id, !_model.Locked);
             BuildContextMenu();
         });
+
+        var group = Sub("Group");
         Add("Group with…", () =>
         {
             var target = _manager.PickFenceToGroupWith(_model.Id);
             if (target is null) return;
             _manager.JoinFenceGroup(_model.Id, target);
-        });
+        }, group.Items);
+
         if (_manager.IsEffectivelyGrouped(_model.Id))
         {
             Add("Rename group…", () =>
@@ -1678,19 +1688,20 @@ public sealed class FenceWindow : Window
                     "Rename group",
                     "Group name (leave blank to clear):",
                     current);
-                if (name is null) return; // cancelled
+                if (name is null) return;
                 _manager.SetGroupName(_model.GroupId!, name);
-            });
-            Add("Ungroup this fence", () => _manager.LeaveFenceGroup(_model.Id));
-            Add("Ungroup all in this group", () => _manager.DissolveFenceGroup(_model.Id));
-            Add("Match size to this fence (group)", () => _manager.MatchGroupSize(_model.Id));
+            }, group.Items);
+            Add("Ungroup this fence", () => _manager.LeaveFenceGroup(_model.Id), group.Items);
+            Add("Ungroup all", () => _manager.DissolveFenceGroup(_model.Id), group.Items);
+            Add("Match size to this fence", () => _manager.MatchGroupSize(_model.Id), group.Items);
         }
         else if (!string.IsNullOrWhiteSpace(_model.GroupId))
         {
-            // Orphan groupId (alone in group) — offer a clean detach
-            Add("Clear stuck group link", () => _manager.LeaveFenceGroup(_model.Id));
+            Add("Clear stuck group link", () => _manager.LeaveFenceGroup(_model.Id), group.Items);
         }
+
         cm.Items.Add(new Separator());
+        Add("New fence", () => _manager.NewFenceFromTray());
         Add("Delete fence", () =>
         {
             if (MessageBox.Show($"Delete fence \"{_model.Title}\"?", "FenceDesk",
@@ -1701,95 +1712,361 @@ public sealed class FenceWindow : Window
         ContextMenu = cm;
     }
 
-    private void ShowOpacityDialog()
+    public void ShowAppearanceDialog(bool applyToAllByDefault = false, bool showFencePicker = false)
     {
-        // Reload latest from store first so we don't start from a stale value
         _model = _manager.LayoutStore.FindFence(_model.Id) ?? _model;
-        var original = Math.Clamp(_model.Opacity, 0.15, 1.0);
+
+        var originals = _manager.LayoutStore.Layout.Fences.ToDictionary(
+            f => f.Id,
+            f => (
+                Bg: string.IsNullOrWhiteSpace(f.BgColor) ? DefaultBgColor : f.BgColor,
+                Text: string.IsNullOrWhiteSpace(f.TextColor) ? DefaultTextColor : f.TextColor,
+                Opacity: Math.Clamp(f.Opacity, 0.15, 1.0)
+            ));
+
+        var targetId = _model.Id;
+        string draftBg;
+        string draftText;
+        double draftOpacity;
+        if (originals.TryGetValue(targetId, out var seed))
+        {
+            draftBg = seed.Bg;
+            draftText = seed.Text;
+            draftOpacity = seed.Opacity;
+        }
+        else
+        {
+            draftBg = DefaultBgColor;
+            draftText = DefaultTextColor;
+            draftOpacity = 0.72;
+        }
+
         var win = new Window
         {
-            Title = "Fence opacity",
-            Width = 400,
-            Height = 200,
+            Title = "Appearance",
+            Width = 380,
+            SizeToContent = SizeToContent.Height,
             WindowStartupLocation = WindowStartupLocation.CenterScreen,
             ResizeMode = ResizeMode.NoResize,
-            Background = new SolidColorBrush(Color.FromRgb(30, 36, 48)),
+            Background = new SolidColorBrush(Color.FromRgb(22, 30, 44)),
             ShowInTaskbar = false,
             Topmost = true
         };
-        var grid = new Grid { Margin = new Thickness(16) };
-        for (var i = 0; i < 4; i++)
-            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 
-        var lbl = new TextBlock
+        var root = new StackPanel { Margin = new Thickness(18) };
+        var labelFg = new SolidColorBrush(Color.FromRgb(200, 208, 220));
+        var btnBg = new SolidColorBrush(Color.FromRgb(40, 54, 74));
+        var btnFg = new SolidColorBrush(Color.FromRgb(220, 230, 245));
+        var btnBorder = new SolidColorBrush(Color.FromRgb(70, 96, 130));
+        var swatchPaints = new List<Action>();
+        var suppressPreview = false;
+
+        var applyAll = new System.Windows.Controls.CheckBox
         {
-            Text = "Panel transparency (icons stay solid)\nLower = more see-through to desktop",
-            Foreground = new SolidColorBrush(Color.FromRgb(200, 208, 220)),
-            Margin = new Thickness(0, 0, 0, 8),
-            TextWrapping = TextWrapping.Wrap
+            Content = "Apply to all fences",
+            Foreground = labelFg,
+            Margin = new Thickness(0, 0, 0, 14),
+            IsChecked = applyToAllByDefault
         };
-        Grid.SetRow(lbl, 0);
+
         var valueLbl = new TextBlock
         {
-            Text = $"{(int)Math.Round(original * 100)}%",
-            Foreground = new SolidColorBrush(Color.FromRgb(200, 208, 220)),
-            FontSize = 16,
+            Text = $"{(int)Math.Round(draftOpacity * 100)}%",
+            Foreground = labelFg,
+            FontSize = 15,
             FontWeight = FontWeights.SemiBold,
             HorizontalAlignment = HorizontalAlignment.Center,
-            Margin = new Thickness(0, 0, 0, 8)
+            Margin = new Thickness(0, 0, 0, 4)
         };
-        Grid.SetRow(valueLbl, 1);
+
         var slider = new Slider
         {
-            Minimum = 15, // avoid fully invisible fences
+            Minimum = 15,
             Maximum = 100,
             TickFrequency = 5,
             IsSnapToTickEnabled = false,
-            Value = Math.Clamp(Math.Round(original * 100), 15, 100),
+            Value = Math.Clamp(Math.Round(draftOpacity * 100), 15, 100),
             Margin = new Thickness(0, 0, 0, 12)
         };
-        Grid.SetRow(slider, 2);
+
+        void PushPreview()
+        {
+            if (suppressPreview) return;
+            var o = slider.Value / 100.0;
+            draftOpacity = o;
+            if (applyAll.IsChecked == true)
+                _manager.PreviewAppearance(draftBg, draftText, o);
+            else
+                _manager.PreviewAppearance(draftBg, draftText, o, onlyFenceId: targetId);
+        }
+
+        void SyncControlsFromDraft()
+        {
+            suppressPreview = true;
+            slider.Value = Math.Clamp(Math.Round(draftOpacity * 100), 15, 100);
+            valueLbl.Text = $"{(int)slider.Value}%";
+            suppressPreview = false;
+            foreach (var paint in swatchPaints) paint();
+        }
+
+        if (showFencePicker)
+        {
+            root.Children.Add(new TextBlock
+            {
+                Text = "Fence",
+                FontWeight = FontWeights.SemiBold,
+                Foreground = labelFg,
+                Margin = new Thickness(0, 0, 0, 6)
+            });
+
+            var fenceBox = new System.Windows.Controls.ComboBox
+            {
+                Margin = new Thickness(0, 0, 0, 14),
+                Background = btnBg,
+                Foreground = btnFg,
+                BorderBrush = btnBorder,
+                Padding = new Thickness(8, 6, 8, 6)
+            };
+
+            string FenceLabel(FenceModel f)
+            {
+                var title = string.IsNullOrWhiteSpace(f.Title) ? "Untitled" : f.Title;
+                if (!string.IsNullOrWhiteSpace(f.GroupId) && _manager.IsEffectivelyGrouped(f.Id))
+                {
+                    var g = _manager.GetGroupName(f.GroupId);
+                    if (!string.IsNullOrWhiteSpace(g))
+                        return $"{g} · {title}";
+                }
+                return title;
+            }
+
+            System.Windows.Controls.ComboBoxItem? selectItem = null;
+            foreach (var f in _manager.LayoutStore.Layout.Fences.OrderBy(FenceLabel))
+            {
+                var item = new System.Windows.Controls.ComboBoxItem
+                {
+                    Content = FenceLabel(f),
+                    Tag = f.Id
+                };
+                fenceBox.Items.Add(item);
+                if (f.Id == targetId) selectItem = item;
+            }
+            fenceBox.SelectedItem = selectItem ?? fenceBox.Items.OfType<System.Windows.Controls.ComboBoxItem>().FirstOrDefault();
+
+            fenceBox.SelectionChanged += (_, _) =>
+            {
+                if (fenceBox.SelectedItem is not System.Windows.Controls.ComboBoxItem item)
+                    return;
+                if (item.Tag is not string newId || newId == targetId)
+                    return;
+
+                var prevId = targetId;
+                targetId = newId;
+
+                if (applyAll.IsChecked == true)
+                    return;
+
+                _manager.RestoreAppearanceSnapshot(originals, onlyFenceId: prevId);
+                if (originals.TryGetValue(targetId, out var snap))
+                {
+                    draftBg = snap.Bg;
+                    draftText = snap.Text;
+                    draftOpacity = snap.Opacity;
+                    SyncControlsFromDraft();
+                }
+                PushPreview();
+            };
+            root.Children.Add(fenceBox);
+        }
+
+        void AddSwatchRow(string label, Func<string> getHex, Action<string> setHex)
+        {
+            var row = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 10) };
+            var swatch = new Border
+            {
+                Width = 28,
+                Height = 28,
+                CornerRadius = new CornerRadius(4),
+                BorderBrush = new SolidColorBrush(Color.FromRgb(90, 110, 140)),
+                BorderThickness = new Thickness(1),
+                Margin = new Thickness(0, 0, 10, 0),
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            void PaintSwatch()
+            {
+                var rgb = FenceManager.ParseHex(getHex());
+                swatch.Background = new SolidColorBrush(Color.FromRgb(rgb.R, rgb.G, rgb.B));
+            }
+            PaintSwatch();
+            swatchPaints.Add(PaintSwatch);
+            var btn = new Button
+            {
+                Content = label,
+                Padding = new Thickness(12, 7, 12, 7),
+                Background = btnBg,
+                Foreground = btnFg,
+                BorderBrush = btnBorder,
+                HorizontalContentAlignment = HorizontalAlignment.Left,
+                MinWidth = 180
+            };
+            btn.Click += (_, _) =>
+            {
+                var c = FenceManager.PickColor(getHex());
+                if (c is null) return;
+                setHex(FenceManager.ToHex(c.Value.R, c.Value.G, c.Value.B));
+                PaintSwatch();
+            };
+            row.Children.Add(swatch);
+            row.Children.Add(btn);
+            root.Children.Add(row);
+        }
+
+        root.Children.Add(new TextBlock
+        {
+            Text = "Colors",
+            FontWeight = FontWeights.SemiBold,
+            Foreground = labelFg,
+            Margin = new Thickness(0, 0, 0, 10)
+        });
+
+        AddSwatchRow("Background color…", () => draftBg, hex =>
+        {
+            draftBg = hex;
+            PushPreview();
+        });
+
+        AddSwatchRow("Text color…", () => draftText, hex =>
+        {
+            draftText = hex;
+            PushPreview();
+        });
+
+        root.Children.Add(new TextBlock
+        {
+            Text = "Opacity",
+            FontWeight = FontWeights.SemiBold,
+            Foreground = labelFg,
+            Margin = new Thickness(0, 8, 0, 6)
+        });
+        root.Children.Add(new TextBlock
+        {
+            Text = "Panel only — icons stay solid",
+            Foreground = new SolidColorBrush(Color.FromRgb(150, 162, 180)),
+            FontSize = 11,
+            Margin = new Thickness(0, 0, 0, 6)
+        });
+
+        root.Children.Add(valueLbl);
         slider.ValueChanged += (_, _) =>
         {
-            var o = slider.Value / 100.0;
             valueLbl.Text = $"{(int)slider.Value}%";
-            _model.Opacity = o;
-            // Write through to store object so nothing reloads an old value mid-drag
-            var stored = _manager.LayoutStore.FindFence(_model.Id);
-            if (stored is not null) stored.Opacity = o;
-            ApplyWindowOpacity();
+            PushPreview();
         };
-        var sp = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
-        Grid.SetRow(sp, 3);
-        var ok = new Button { Content = "OK", Width = 80, Margin = new Thickness(0, 0, 8, 0), IsDefault = true };
+        root.Children.Add(slider);
+
+        applyAll.Checked += (_, _) => PushPreview();
+        applyAll.Unchecked += (_, _) =>
+        {
+            // Put every other fence back; keep draft on the selected target
+            foreach (var id in originals.Keys)
+            {
+                if (id == targetId) continue;
+                _manager.RestoreAppearanceSnapshot(originals, onlyFenceId: id);
+            }
+            PushPreview();
+        };
+        root.Children.Add(applyAll);
+
+        var buttons = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            HorizontalAlignment = HorizontalAlignment.Right
+        };
+        var reset = new Button
+        {
+            Content = "Reset",
+            Width = 72,
+            Margin = new Thickness(0, 0, 8, 0),
+            Background = btnBg,
+            Foreground = btnFg,
+            BorderBrush = btnBorder,
+            Padding = new Thickness(0, 6, 0, 6)
+        };
+        reset.Click += (_, _) =>
+        {
+            draftBg = DefaultBgColor;
+            draftText = DefaultTextColor;
+            draftOpacity = 0.72;
+            SyncControlsFromDraft();
+            PushPreview();
+        };
+        var ok = new Button
+        {
+            Content = "OK",
+            Width = 72,
+            Margin = new Thickness(0, 0, 8, 0),
+            IsDefault = true,
+            Background = new SolidColorBrush(Color.FromRgb(50, 90, 140)),
+            Foreground = btnFg,
+            BorderBrush = new SolidColorBrush(Color.FromRgb(80, 130, 190)),
+            Padding = new Thickness(0, 6, 0, 6)
+        };
         ok.Click += (_, _) =>
         {
-            _model.Opacity = slider.Value / 100.0;
-            _manager.LayoutStore.UpdateFence(_model);
-            ApplyWindowOpacity();
+            var applyToAll = applyAll.IsChecked == true;
+            var o = slider.Value / 100.0;
+
+            if (applyToAll)
+            {
+                _manager.SetAllAppearance(draftBg, draftText, o);
+            }
+            else
+            {
+                // Ensure non-target fences are back to originals, then commit target
+                foreach (var id in originals.Keys)
+                {
+                    if (id == targetId) continue;
+                    _manager.RestoreAppearanceSnapshot(originals, onlyFenceId: id);
+                }
+                var target = _manager.LayoutStore.FindFence(targetId);
+                if (target is not null)
+                {
+                    target.BgColor = draftBg;
+                    target.TextColor = draftText;
+                    target.Opacity = o;
+                    _manager.LayoutStore.UpdateFence(target);
+                    if (_manager.Windows.TryGetValue(targetId, out var tw))
+                        tw.ApplyAppearanceFromStore(draftBg, draftText, o);
+                }
+                _manager.LayoutStore.SaveImmediate();
+            }
+
             win.DialogResult = true;
-            win.Close();
         };
-        var cancel = new Button { Content = "Cancel", Width = 80, IsCancel = true };
+        var cancel = new Button
+        {
+            Content = "Cancel",
+            Width = 72,
+            IsCancel = true,
+            Background = btnBg,
+            Foreground = btnFg,
+            BorderBrush = btnBorder,
+            Padding = new Thickness(0, 6, 0, 6)
+        };
         cancel.Click += (_, _) =>
         {
-            _model.Opacity = original;
-            var stored = _manager.LayoutStore.FindFence(_model.Id);
-            if (stored is not null) stored.Opacity = original;
-            ApplyWindowOpacity();
+            _manager.RestoreAppearanceSnapshot(originals);
+            _manager.LayoutStore.SaveImmediate();
             win.Close();
         };
-        sp.Children.Add(ok);
-        sp.Children.Add(cancel);
-        grid.Children.Add(lbl);
-        grid.Children.Add(valueLbl);
-        grid.Children.Add(slider);
-        grid.Children.Add(sp);
-        win.Content = grid;
-        // Apply current value once when opening
-        ApplyWindowOpacity();
+        buttons.Children.Add(reset);
+        buttons.Children.Add(ok);
+        buttons.Children.Add(cancel);
+        root.Children.Add(buttons);
+        win.Content = root;
         win.ShowDialog();
     }
+
 
     private void EmptyArea_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {

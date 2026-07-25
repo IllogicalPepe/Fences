@@ -796,37 +796,146 @@ public sealed class FenceManager
         return result;
     }
 
+    /// <summary>
+    /// Open the shared Appearance dialog (same UI as fence right-click).
+    /// From tray/panel: shows a fence picker; apply-to-all defaults on.
+    /// </summary>
+    public void ShowAppearanceEditor(bool applyToAllByDefault = true, bool showFencePicker = true)
+    {
+        RunOnUi(() =>
+        {
+            var win = _windows.Values.FirstOrDefault();
+            if (win is null)
+            {
+                System.Windows.MessageBox.Show(
+                    "Create a fence first to edit appearance.",
+                    "FenceDesk",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Information);
+                return;
+            }
+            win.ShowAppearanceDialog(applyToAllByDefault, showFencePicker);
+        });
+    }
+
+    /// <summary>Live-preview appearance without persisting to disk.</summary>
+    public void PreviewAppearance(string bgColor, string textColor, double opacity, string? onlyFenceId = null)
+    {
+        var o = Math.Clamp(opacity, 0.08, 1.0);
+        RunOnUi(() =>
+        {
+            foreach (var f in _layout.Layout.Fences.ToList())
+            {
+                if (onlyFenceId is not null && f.Id != onlyFenceId) continue;
+                f.BgColor = bgColor;
+                f.TextColor = textColor;
+                f.Opacity = o;
+            }
+            foreach (var (id, w) in _windows.ToList())
+            {
+                if (onlyFenceId is not null && id != onlyFenceId) continue;
+                w.ApplyAppearanceFromStore(bgColor, textColor, o, persist: false);
+            }
+        });
+    }
+
+    /// <summary>Restore fences to a prior appearance snapshot (no disk save).</summary>
+    public void RestoreAppearanceSnapshot(
+        IReadOnlyDictionary<string, (string Bg, string Text, double Opacity)> originals,
+        string? onlyFenceId = null)
+    {
+        RunOnUi(() =>
+        {
+            foreach (var f in _layout.Layout.Fences.ToList())
+            {
+                if (onlyFenceId is not null && f.Id != onlyFenceId) continue;
+                if (!originals.TryGetValue(f.Id, out var snap)) continue;
+                f.BgColor = snap.Bg;
+                f.TextColor = snap.Text;
+                f.Opacity = snap.Opacity;
+            }
+            foreach (var (id, w) in _windows.ToList())
+            {
+                if (onlyFenceId is not null && id != onlyFenceId) continue;
+                if (!originals.TryGetValue(id, out var snap)) continue;
+                w.ApplyAppearanceFromStore(snap.Bg, snap.Text, snap.Opacity, persist: false);
+            }
+        });
+    }
+
     public void SetAllBackgroundColor(string hex)
     {
-        foreach (var f in _layout.Layout.Fences)
+        SetAllAppearance(bgColor: hex, textColor: null, opacity: null);
+    }
+
+    public void SetAllTextColor(string hex)
+    {
+        SetAllAppearance(bgColor: null, textColor: hex, opacity: null);
+    }
+
+    public void SetAllOpacity(double opacity)
+    {
+        SetAllAppearance(bgColor: null, textColor: null, opacity: opacity);
+    }
+
+    /// <summary>
+    /// Apply appearance fields to every fence (null = leave unchanged).
+    /// Updates store + live windows so bulk changes always paint.
+    /// </summary>
+    public void SetAllAppearance(string? bgColor, string? textColor, double? opacity)
+    {
+        var o = opacity is null ? (double?)null : Math.Clamp(opacity.Value, 0.08, 1.0);
+        RunOnUi(() =>
         {
-            f.BgColor = hex;
-            _layout.UpdateFence(f);
-            if (_windows.TryGetValue(f.Id, out var w))
-                w.ApplyGlassAppearance();
-        }
-        _layout.SaveImmediate();
+            foreach (var f in _layout.Layout.Fences.ToList())
+            {
+                if (bgColor is not null) f.BgColor = bgColor;
+                if (textColor is not null) f.TextColor = textColor;
+                if (o is not null) f.Opacity = o.Value;
+                _layout.UpdateFence(f);
+            }
+
+            foreach (var w in _windows.Values.ToList())
+                w.ApplyAppearanceFromStore(bgColor, textColor, o);
+
+            _layout.SaveImmediate();
+        });
     }
 
     /// <summary>Reset background + text colors on every fence to defaults.</summary>
     public void ResetAllFenceColors()
     {
-        foreach (var f in _layout.Layout.Fences)
+        RunOnUi(() =>
         {
-            f.BgColor = FenceWindow.DefaultBgColor;
-            f.TextColor = FenceWindow.DefaultTextColor;
-            _layout.UpdateFence(f);
-            if (_windows.TryGetValue(f.Id, out var w))
+            foreach (var f in _layout.Layout.Fences.ToList())
             {
-                w.ApplyGlassAppearance();
+                f.BgColor = FenceWindow.DefaultBgColor;
+                f.TextColor = FenceWindow.DefaultTextColor;
+                _layout.UpdateFence(f);
+            }
+            foreach (var w in _windows.Values.ToList())
+            {
+                w.ApplyAppearanceFromStore(
+                    FenceWindow.DefaultBgColor,
+                    FenceWindow.DefaultTextColor,
+                    opacity: null);
                 w.RefreshContent();
             }
-        }
-        _layout.SaveImmediate();
+            _layout.SaveImmediate();
+        });
     }
 
     /// <summary>Legacy name — resets background and text.</summary>
     public void ResetAllBackgroundColors() => ResetAllFenceColors();
+
+    private static void RunOnUi(Action action)
+    {
+        var dispatcher = Application.Current?.Dispatcher;
+        if (dispatcher is not null && !dispatcher.CheckAccess())
+            dispatcher.Invoke(action);
+        else
+            action();
+    }
 
     public void CloseAll()
     {
@@ -1142,7 +1251,9 @@ public sealed class FenceManager
         form.Controls.AddRange(new System.Windows.Forms.Control[] { lbl, tb, ok, cancel });
         form.AcceptButton = ok;
         form.CancelButton = cancel;
-        return form.ShowDialog() == System.Windows.Forms.DialogResult.OK ? tb.Text : null;
+        if (form.ShowDialog() != System.Windows.Forms.DialogResult.OK)
+            return null;
+        return EmojiTextConverter.Convert(tb.Text);
     }
 
     public static (byte R, byte G, byte B)? PickColor(string seedHex)

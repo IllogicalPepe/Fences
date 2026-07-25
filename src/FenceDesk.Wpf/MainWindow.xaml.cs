@@ -73,17 +73,11 @@ public partial class MainWindow : Window
         }
     }
 
-    private void BtnShow_Click(object sender, RoutedEventArgs e) => _manager.ShowAll();
     private void BtnHide_Click(object sender, RoutedEventArgs e) => _manager.HideAll();
     private void BtnFront_Click(object sender, RoutedEventArgs e) => _manager.BringToFront();
     private void BtnNew_Click(object sender, RoutedEventArgs e) => _manager.NewFenceFromTray();
-    private void BtnColorAll_Click(object sender, RoutedEventArgs e)
-    {
-        var seed = _manager.LayoutStore.Layout.Fences.FirstOrDefault()?.BgColor ?? "#0F1724";
-        var c = FenceManager.PickColor(seed);
-        if (c is null) return;
-        _manager.SetAllBackgroundColor(FenceManager.ToHex(c.Value.R, c.Value.G, c.Value.B));
-    }
+    private void BtnColorAll_Click(object sender, RoutedEventArgs e) =>
+        _manager.ShowAppearanceEditor(applyToAllByDefault: true);
     private void BtnReset_Click(object sender, RoutedEventArgs e) => _manager.ResetAllBackgroundColors();
     private void BtnExit_Click(object sender, RoutedEventArgs e)
     {

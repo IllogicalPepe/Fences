@@ -19,6 +19,11 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 
+# Transient Launch.bat status markers (if written)
+Building
+Stopping
+Updating
+
 # Python / caches if any
 __pycache__/
 *.pyc
