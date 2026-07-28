@@ -625,8 +625,13 @@ public sealed class FenceManager
     }
 
     /// <summary>Magnetic snap of Left/Top against other visible fences.</summary>
+    /// <param name="allowGroupSiblingSnap">
+    /// When true (solo rearrange of a grouped fence), allow snapping to other members of the same group.
+    /// When false (normal group drag), siblings are skipped so the whole group doesn't stick to itself.
+    /// </param>
     public (double Left, double Top) GetSnappedPosition(
-        string fenceId, double left, double top, double width, double height, double threshold = 14)
+        string fenceId, double left, double top, double width, double height,
+        double threshold = 14, bool allowGroupSiblingSnap = false)
     {
         var bestLeft = left;
         var bestTop = top;
@@ -639,10 +644,12 @@ public sealed class FenceManager
         {
             if (id == fenceId || win.ToggleHidden) continue;
             if (!win.IsVisible || win.Visibility != Visibility.Visible) continue;
-            // Skip group siblings while dragging together (optional: still snap to non-group)
+            // Skip group siblings while dragging together; allow them when rearranging one fence alone
             var other = _layout.FindFence(id);
             var self = _layout.FindFence(fenceId);
-            if (self?.GroupId is not null && self.GroupId == other?.GroupId) continue;
+            if (!allowGroupSiblingSnap
+                && self?.GroupId is not null
+                && self.GroupId == other?.GroupId) continue;
 
             var oL = win.Left;
             var oT = win.Top;

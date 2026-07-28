@@ -3,7 +3,7 @@
 ; Or:          ISCC.exe FenceDesk.iss   (after publishing to ..\dist\publish)
 
 #define MyAppName      "FenceDesk"
-#define MyAppVersion   "2.1.0"
+#define MyAppVersion   "2.1.1"
 #define MyAppPublisher "FenceDesk"
 #define MyAppExeName   "FenceDesk.exe"
 #define MyAppId        "{{8F3C2A91-6B4E-4D7A-9C1F-E5A8B0D4F627}"

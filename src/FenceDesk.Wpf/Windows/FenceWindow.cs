@@ -36,6 +36,8 @@ public sealed class FenceWindow : Window
     private bool _hasRestRect;
     private Border _titleBar = null!;
     private bool _groupDragging;
+    private bool _soloGroupDrag;
+    private bool _forceSoloDragNext;
     private System.Windows.Point _groupDragScreenStart;
     private readonly Dictionary<string, (double L, double T)> _groupDragOrigins = new();
 
@@ -860,10 +862,12 @@ public sealed class FenceWindow : Window
             _titleBar.Cursor = _model.Locked ? Cursors.Arrow : Cursors.SizeAll;
             if (_model.Locked)
                 _titleBar.ToolTip = "Locked — right-click to unlock";
+            else if (_forceSoloDragNext && grouped)
+                _titleBar.ToolTip = "Rearrange mode — drag to move this fence only (still grouped)";
             else if (grouped)
                 _titleBar.ToolTip = string.IsNullOrWhiteSpace(groupName)
-                    ? "Grouped — drag moves all linked fences"
-                    : $"Group \"{groupName}\" — drag moves all linked fences";
+                    ? "Grouped — drag moves all · Alt+drag moves this fence only"
+                    : $"Group \"{groupName}\" — drag moves all · Alt+drag moves this fence only";
             else
                 _titleBar.ToolTip = "Double-click title to roll up · drag empty area to multi-select";
         }
@@ -1691,6 +1695,20 @@ public sealed class FenceWindow : Window
                 if (name is null) return;
                 _manager.SetGroupName(_model.GroupId!, name);
             }, group.Items);
+            Add("Rearrange this fence only", () =>
+            {
+                if (_model.Locked)
+                {
+                    MessageBox.Show(
+                        "Unlock this fence first to rearrange it.",
+                        "FenceDesk",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Information);
+                    return;
+                }
+                _forceSoloDragNext = true;
+                UpdateLockChrome();
+            }, group.Items);
             Add("Ungroup this fence", () => _manager.LeaveFenceGroup(_model.Id), group.Items);
             Add("Ungroup all", () => _manager.DissolveFenceGroup(_model.Id), group.Items);
             Add("Match size to this fence", () => _manager.MatchGroupSize(_model.Id), group.Items);
@@ -2134,12 +2152,20 @@ public sealed class FenceWindow : Window
         }
         if (e.ChangedButton != MouseButton.Left) return;
 
-        // Group-aware drag (moves linked fences together when effectively grouped)
+        // Group-aware drag (moves linked fences together when effectively grouped).
+        // Alt+drag or "Rearrange this fence only" moves just this fence while staying grouped.
         _model = _manager.LayoutStore.FindFence(_model.Id) ?? _model;
         _groupDragging = true;
+        _soloGroupDrag = _forceSoloDragNext
+            || (Keyboard.Modifiers & ModifierKeys.Alt) == ModifierKeys.Alt;
+        _forceSoloDragNext = false;
+        if (_soloGroupDrag) UpdateLockChrome();
         _groupDragScreenStart = PointToScreen(e.GetPosition(this));
         _groupDragOrigins.Clear();
-        foreach (var f in _manager.GetLinkedFences(_model.Id))
+        var toMove = _soloGroupDrag
+            ? new[] { _model }
+            : _manager.GetLinkedFences(_model.Id);
+        foreach (var f in toMove)
         {
             if (_manager.Windows.TryGetValue(f.Id, out var win))
                 _groupDragOrigins[f.Id] = (win.Left, win.Top);
@@ -2181,12 +2207,15 @@ public sealed class FenceWindow : Window
     {
         if (!_groupDragging) return;
         _groupDragging = false;
+        var solo = _soloGroupDrag;
+        _soloGroupDrag = false;
         try { _titleBar.ReleaseMouseCapture(); } catch { /* ignore */ }
 
         if (snap && !_model.Locked)
         {
             var (sl, st) = _manager.GetSnappedPosition(
-                _model.Id, Left, Top, ActualWidth, ActualHeight);
+                _model.Id, Left, Top, ActualWidth, ActualHeight,
+                allowGroupSiblingSnap: solo);
             var sdx = sl - Left;
             var sdy = st - Top;
             if (Math.Abs(sdx) > 0.01 || Math.Abs(sdy) > 0.01)
@@ -2207,8 +2236,12 @@ public sealed class FenceWindow : Window
             }
         }
 
-        _manager.SyncGroupGeometryFromLeader(_model.Id);
+        if (solo)
+            PushGeometryToModel();
+        else
+            _manager.SyncGroupGeometryFromLeader(_model.Id);
         _groupDragOrigins.Clear();
+        if (solo) UpdateLockChrome();
     }
 
     private void ToggleRollUp()

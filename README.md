@@ -8,7 +8,7 @@ Organize shortcuts, files, and folders into translucent **fences** on your deskt
 
 ## Install (users)
 
-1. Download **`FenceDesk-Setup-2.1.0.exe`** from the [latest GitHub Release](https://github.com/IllogicalPepe/Fences/releases/latest)
+1. Download **`FenceDesk-Setup-2.1.1.exe`** from the [latest GitHub Release](https://github.com/IllogicalPepe/Fences/releases/latest)
 2. Double-click the installer (no admin required)
 3. Find the **FenceDesk** tray icon near the clock
 
@@ -43,7 +43,7 @@ Creates `src\FenceDesk.Wpf\bin\Release\net8.0-windows\FenceDesk.exe`.
 Build-Installer.bat
 ```
 
-Produces `dist\FenceDesk-Setup-2.1.0.exe` (self-contained; friends do not need the .NET runtime).
+Produces `dist\FenceDesk-Setup-2.1.1.exe` (self-contained; friends do not need the .NET runtime).
 
 ### Local update (dev)
 

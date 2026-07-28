@@ -9,7 +9,7 @@
     <ApplicationIcon>..\..\Assets\FenceDesk.ico</ApplicationIcon>
     <AssemblyName>FenceDesk</AssemblyName>
     <RootNamespace>FenceDesk</RootNamespace>
-    <Version>2.1.0</Version>
+    <Version>2.1.1</Version>
     <Description>Desktop fence organizer for Windows (C# + WPF)</Description>
     <ApplicationManifest>app.manifest</ApplicationManifest>
   </PropertyGroup>

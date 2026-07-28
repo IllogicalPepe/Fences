@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
   Build a Windows installer (Inno Setup):
-    dist\FenceDesk-Setup-2.1.0.exe
+    dist\FenceDesk-Setup-2.1.1.exe
 
   Steps:
     1. Publish self-contained win-x64 app to dist\publish
@@ -14,7 +14,7 @@
 param(
     [ValidateSet("win-x64", "win-arm64", "win-x86")]
     [string]$Runtime = "win-x64",
-    [string]$Version = "2.1.0",
+    [string]$Version = "2.1.1",
     [switch]$SkipPublish,
     [string]$IsccPath = ""
 )
