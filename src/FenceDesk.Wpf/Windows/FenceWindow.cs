@@ -29,6 +29,8 @@ public sealed class FenceWindow : Window
     private readonly Border _glass;
     /// <summary>Client-drawn white resize chrome (edges + corner grip). WindowChrome alone is invisible.</summary>
     private readonly FrameworkElement _resizeChrome;
+    private readonly Canvas _fxLayer;
+    private bool _deleteFxActive;
     private double _expandedHeight;
     private bool _readyToSync;
     private bool _suppressGeometry;
@@ -166,9 +168,11 @@ public sealed class FenceWindow : Window
         root.Children.Add(_body);
         content.Child = root;
         _resizeChrome = BuildResizeChrome();
+        _fxLayer = new Canvas { IsHitTestVisible = false, ClipToBounds = false };
         shell.Children.Add(_glass);
         shell.Children.Add(content);
         shell.Children.Add(_resizeChrome);
+        shell.Children.Add(_fxLayer);
         Content = shell;
 
         // Colors / text / opacity — must run after title bar, hint, panels exist
@@ -907,6 +911,7 @@ public sealed class FenceWindow : Window
 
     public void RefreshContent()
     {
+        if (_deleteFxActive) return;
         _model = _manager.LayoutStore.FindFence(_model.Id) ?? _model;
         _model.EnsureDefaults();
         UpdateLockChrome();
@@ -1240,7 +1245,7 @@ public sealed class FenceWindow : Window
                 var toRemove = _selectedPaths.Contains(path) && _selectedPaths.Count > 0
                     ? _selectedPaths.ToList()
                     : new List<string> { path };
-                _manager.RemoveItems(_model.Id, toRemove);
+                RemoveFromFenceWithFx(toRemove);
             };
             cm.Items.Add(remove);
         }
@@ -1456,12 +1461,70 @@ public sealed class FenceWindow : Window
 
     private void DeleteSelectedOr(string fallbackPath)
     {
+        if (_deleteFxActive) return;
         var paths = _selectedPaths.Count > 0 ? _selectedPaths.ToList() : new List<string> { fallbackPath };
-        if (_manager.DeleteFromDisk(paths) > 0)
+        var resolved = _manager.CollectDeletablePaths(paths);
+        if (resolved.Count == 0) return;
+        if (!_manager.ConfirmPermanentDelete(resolved)) return;
+
+        PlayDeleteFx(paths, () =>
         {
+            _manager.DeleteFromDisk(resolved, confirm: false);
             _selectedPaths.Clear();
             RefreshContent();
+        });
+    }
+
+    private void RemoveFromFenceWithFx(IReadOnlyList<string> paths)
+    {
+        if (_deleteFxActive || paths.Count == 0) return;
+        PlayDeleteFx(paths, () =>
+        {
+            _manager.RemoveItems(_model.Id, paths);
+            _selectedPaths.Clear();
+        });
+    }
+
+    private void PlayDeleteFx(IReadOnlyList<string> paths, Action commit)
+    {
+        var tiles = new List<Border>();
+        foreach (var p in paths)
+        {
+            if (_tileByPath.TryGetValue(p, out var tile))
+                tiles.Add(tile);
         }
+
+        if (tiles.Count == 0)
+        {
+            commit();
+            return;
+        }
+
+        _deleteFxActive = true;
+        var remaining = tiles.Count;
+        var iconPx = (double)_manager.Icons.IconSize;
+        for (var i = 0; i < tiles.Count; i++)
+        {
+            var tile = tiles[i];
+            var icon = GetTileIcon(tile);
+            BlackHoleDeleteFx.Play(_fxLayer, tile, icon, iconPx, TimeSpan.FromMilliseconds(70 * i), () =>
+            {
+                remaining--;
+                if (remaining > 0) return;
+                _deleteFxActive = false;
+                _fxLayer.Children.Clear();
+                commit();
+            });
+        }
+    }
+
+    private static ImageSource? GetTileIcon(Border tile)
+    {
+        if (tile.Child is StackPanel sp &&
+            sp.Children.Count > 0 &&
+            sp.Children[0] is Image img)
+            return img.Source;
+        return null;
     }
 
     private void StartItemDrag(FrameworkElement source, IReadOnlyList<string> paths)
@@ -2122,16 +2185,11 @@ public sealed class FenceWindow : Window
         }
         if (e.Key is Key.Delete or Key.Back)
         {
-            if (_selectedPaths.Count == 0) return;
+            if (_selectedPaths.Count == 0 || _deleteFxActive) return;
             if (_model.IsPortal)
-            {
                 DeleteSelectedOr(_selectedPaths.First());
-            }
             else
-            {
-                _manager.RemoveItems(_model.Id, _selectedPaths.ToList());
-                _selectedPaths.Clear();
-            }
+                RemoveFromFenceWithFx(_selectedPaths.ToList());
             e.Handled = true;
         }
     }

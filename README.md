@@ -1,13 +1,14 @@
-## FenceDesk 2.1.1
+## FenceDesk 2.1.2
 
 Desktop fence organizer for Windows (WPF).
 
 ### Install
-Download **[FenceDesk-Setup-2.1.1.exe](https://github.com/IllogicalPepe/Fences/releases/latest/download/FenceDesk-Setup-2.1.1.exe)** and run it (no admin required).
+Download **[FenceDesk-Setup-2.1.2.exe](https://github.com/IllogicalPepe/Fences/releases/latest/download/FenceDesk-Setup-2.1.2.exe)** and run it (no admin required).
 
 ### What's new
-- **Rearrange one fence in a group** — Alt+drag the title bar, or right-click → Group → Rearrange this fence only
-- Stays grouped; siblings no longer have to move together when you only want to nudge one
+- **Black hole delete** — deleting or removing an icon swirls an accretion disk around it, then swallows the tile
+- Works on Delete/Backspace, **Remove from fence**, and portal **Delete from folder…**
+- Multi-select staggers a hole on each icon
 
 ### Uninstall
 Settings → Apps, or Start Menu → FenceDesk → Uninstall

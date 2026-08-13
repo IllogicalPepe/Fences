@@ -1164,33 +1164,40 @@ public sealed class FenceManager
         catch (Exception ex) { AppLog.Write($"RemoveItems restore: {ex.Message}"); }
     }
 
+    public List<string> CollectDeletablePaths(IEnumerable<string> paths)
+    {
+        return paths
+            .Where(p => !string.IsNullOrWhiteSpace(p))
+            .Select(p => _desktopIcons.ResolveItemPath(p))
+            .Where(p => !DesktopIconService.IsShellNamespacePath(p))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Where(p => File.Exists(p) || Directory.Exists(p))
+            .ToList();
+    }
+
+    public bool ConfirmPermanentDelete(IReadOnlyList<string> list)
+    {
+        if (list.Count == 0) return false;
+        var preview = list.Count == 1
+            ? Path.GetFileName(list[0])
+            : $"{list.Count} items";
+        var msg = list.Count == 1
+            ? $"Permanently delete \"{preview}\"?\n\n{list[0]}"
+            : $"Permanently delete {preview}?\n\n" + string.Join("\n", list.Take(8).Select(Path.GetFileName))
+              + (list.Count > 8 ? "\n…" : "");
+        return MessageBox.Show(msg, "FenceDesk", MessageBoxButton.YesNo, MessageBoxImage.Warning)
+            == MessageBoxResult.Yes;
+    }
+
     /// <summary>
     /// Deletes files/folders from disk (used by portal fences and optional hard-delete).
     /// Returns count successfully deleted.
     /// </summary>
     public int DeleteFromDisk(IEnumerable<string> paths, bool confirm = true)
     {
-        var list = paths
-            .Where(p => !string.IsNullOrWhiteSpace(p))
-            .Select(p => _desktopIcons.ResolveItemPath(p))
-            .Where(p => !DesktopIconService.IsShellNamespacePath(p))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToList();
+        var list = CollectDeletablePaths(paths);
         if (list.Count == 0) return 0;
-
-        if (confirm)
-        {
-            var preview = list.Count == 1
-                ? Path.GetFileName(list[0])
-                : $"{list.Count} items";
-            var msg = list.Count == 1
-                ? $"Permanently delete \"{preview}\"?\n\n{list[0]}"
-                : $"Permanently delete {preview}?\n\n" + string.Join("\n", list.Take(8).Select(Path.GetFileName))
-                  + (list.Count > 8 ? "\n…" : "");
-            if (MessageBox.Show(msg, "FenceDesk", MessageBoxButton.YesNo, MessageBoxImage.Warning)
-                != MessageBoxResult.Yes)
-                return 0;
-        }
+        if (confirm && !ConfirmPermanentDelete(list)) return 0;
 
         var deleted = 0;
         foreach (var p in list)
