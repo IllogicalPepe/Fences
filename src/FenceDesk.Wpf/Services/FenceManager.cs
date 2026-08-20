@@ -226,7 +226,7 @@ public sealed class FenceManager
             });
             _clickPoller.Start();
             _layout.Layout.Settings.DoubleClickDesktopHide = true;
-            AppLog.Write("Desktop double-click hide/show enabled (ui-poller, no global hooks)");
+            AppLog.Write($"Desktop double-click hide/show enabled v{typeof(FenceManager).Assembly.GetName().Version} (icon-hittest)");
         }
         catch (Exception ex)
         {

@@ -49,7 +49,7 @@ public partial class App : Application
                 return;
             }
 
-            AppLog.Write("WPF OnStartup begin");
+            AppLog.Write($"WPF OnStartup begin v{typeof(App).Assembly.GetName().Version}");
             var layout = new LayoutStore();
             layout.Load();
             AppLog.Write($"Layout loaded: {layout.Layout.Fences.Count} fences");

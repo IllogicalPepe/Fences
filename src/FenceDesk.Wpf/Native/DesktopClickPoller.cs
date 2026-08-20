@@ -6,18 +6,16 @@ namespace FenceDesk.Native;
 
 /// <summary>
 /// Empty-desktop double-click via UI-thread polling only.
-/// No mouse hooks, no Raw Input, no SendMessage into Explorer.
+/// No mouse hooks, no Raw Input, no list-view SendMessage.
 ///
-/// Distinguishing icon vs empty space without LVM_HITTEST:
-/// after a desktop-surface double-click we WAIT briefly; if focus moved to a
-/// normal app / Explorer folder, we cancel (user opened an icon). If focus is
-/// still the desktop shell, we toggle fences.
+/// Icon vs empty wallpaper is decided by DesktopHitTest (MSAA). A deferred
+/// focus/cursor check is only a fallback when accessibility cannot tell.
 /// </summary>
 internal sealed class DesktopClickPoller : IDisposable
 {
     private const int VK_LBUTTON = 0x01;
-    /// <summary>How long to wait to see if an icon launch stole focus.</summary>
-    private const int DeferMs = 220;
+    /// <summary>Fallback wait when we could not hit-test the icon.</summary>
+    private const int DeferMs = 750;
 
     private readonly DispatcherTimer _timer;
     private readonly Action _onDesktopDoubleClick;
@@ -29,12 +27,12 @@ internal sealed class DesktopClickPoller : IDisposable
     private int _clickCount;
     private int _lastFireTick;
 
-    // Pending deferred toggle
+    // Pending deferred toggle (unknown hit-test only)
     private bool _pending;
     private int _pendingDueTick;
     private int _pendingX;
     private int _pendingY;
-    private IntPtr _fgAtPending; // foreground at schedule time — cancel only if focus *moves* to an app
+    private IntPtr _fgAtPending;
 
     public string LastDebug { get; private set; } = "poller";
 
@@ -61,15 +59,21 @@ internal sealed class DesktopClickPoller : IDisposable
     {
         try
         {
-            // Resolve deferred toggle first
             if (_pending)
             {
-                var now = Environment.TickCount;
-                var wait = now - _pendingDueTick;
-                if (wait >= 0)
+                if (LaunchLooksStarted())
                 {
                     _pending = false;
-                    TryFireDeferred();
+                    LastDebug = "cancel-icon-launch";
+                }
+                else
+                {
+                    var wait = Environment.TickCount - _pendingDueTick;
+                    if (wait >= 0)
+                    {
+                        _pending = false;
+                        TryFireDeferred();
+                    }
                 }
             }
 
@@ -102,6 +106,7 @@ internal sealed class DesktopClickPoller : IDisposable
         var isSecond = _clickCount > 0 && dt <= dbl && dx <= slop && dy <= slop;
         if (!isSecond)
         {
+            _pending = false;
             _clickCount = 1;
             _lastClickTick = now;
             _lastClickX = pt.X;
@@ -109,13 +114,14 @@ internal sealed class DesktopClickPoller : IDisposable
             return;
         }
 
+        var firstX = _lastClickX;
+        var firstY = _lastClickY;
         _clickCount = 0;
         _lastClickTick = 0;
 
         var since = now - _lastFireTick;
-        if (since >= 0 && since < 350) return; // hard debounce
+        if (since >= 0 && since < 350) return;
 
-        // Class-name only — never touch Explorer list-view
         if (!DesktopHitTest.IsDesktopSurfaceAt(pt.X, pt.Y))
         {
             LastDebug = "skip " + DesktopHitTest.LastDebug;
@@ -123,30 +129,73 @@ internal sealed class DesktopClickPoller : IDisposable
             return;
         }
 
-        // Defer: icon double-clicks steal focus to the opened app; empty ones don't
+        var icon2 = DesktopHitTest.IsDesktopIconAt(pt.X, pt.Y);
+        var icon1 = DesktopHitTest.IsDesktopIconAt(firstX, firstY);
+        var selected = DesktopHitTest.HasDesktopIconSelection(pt.X, pt.Y);
+
+        // Any icon hit or a selected desktop item → this is opening/clicking a file, not empty space.
+        if (icon1 == true || icon2 == true || selected == true)
+        {
+            LastDebug = "skip-icon " + DesktopHitTest.LastDebug;
+            AppLog.Write($"Desktop dblclick SKIP icon1={icon1} icon2={icon2} sel={selected} {DesktopHitTest.LastDebug}");
+            _pending = false;
+            return;
+        }
+
+        if (icon1 == false && icon2 == false)
+        {
+            if (DesktopHitTest.IsLaunchCursor())
+            {
+                LastDebug = "skip-launch-cursor";
+                AppLog.Write("Desktop dblclick SKIP launch-cursor");
+                _pending = false;
+                return;
+            }
+
+            _lastFireTick = now;
+            LastDebug = "fire-empty " + DesktopHitTest.LastDebug;
+            AppLog.Write($"Desktop dblclick FIRE empty {DesktopHitTest.LastDebug}");
+            _onDesktopDoubleClick();
+            return;
+        }
+
         _pending = true;
         _pendingX = pt.X;
         _pendingY = pt.Y;
         _pendingDueTick = now + DeferMs;
         _fgAtPending = GetForegroundWindow();
         LastDebug = "pending-empty-check " + DesktopHitTest.LastDebug;
+        AppLog.Write($"Desktop dblclick PENDING icon1={icon1} icon2={icon2} sel={selected} {DesktopHitTest.LastDebug}");
+    }
+
+    private bool LaunchLooksStarted()
+    {
+        if (DesktopHitTest.IsLaunchCursor())
+            return true;
+
+        var fg = GetForegroundWindow();
+        return fg != IntPtr.Zero && fg != _fgAtPending && DesktopHitTest.IsLaunchedAppWindow(fg);
     }
 
     private void TryFireDeferred()
     {
         try
         {
-            var fg = GetForegroundWindow();
-            // Only cancel when focus *moved* to a different top-level app/folder.
-            // (If Chrome was already focused and user double-clicks empty desktop,
-            //  FG may stay Chrome — still allow toggle.)
-            if (fg != IntPtr.Zero && fg != _fgAtPending && DesktopHitTest.IsLaunchedAppWindow(fg))
+            if (LaunchLooksStarted())
             {
                 LastDebug = "cancel-icon-launch focus-stole";
+                AppLog.Write("Desktop dblclick CANCEL launch/focus");
                 return;
             }
 
-            // Point of the double-click (or current cursor) must still be desktop surface
+            if (DesktopHitTest.IsDesktopIconAt(_pendingX, _pendingY) == true ||
+                DesktopHitTest.HasDesktopIconSelection(_pendingX, _pendingY) == true)
+            {
+                LastDebug = "cancel-icon " + DesktopHitTest.LastDebug;
+                AppLog.Write("Desktop dblclick CANCEL icon " + DesktopHitTest.LastDebug);
+                return;
+            }
+
             var onDesktop = DesktopHitTest.IsDesktopSurfaceAt(_pendingX, _pendingY);
             if (!onDesktop && GetCursorPos(out var cur))
                 onDesktop = DesktopHitTest.IsDesktopSurfaceAt(cur.X, cur.Y);
@@ -158,7 +207,8 @@ internal sealed class DesktopClickPoller : IDisposable
 
             var now = Environment.TickCount;
             _lastFireTick = now;
-            LastDebug = "fire-empty " + DesktopHitTest.LastDebug;
+            LastDebug = "fire-empty-deferred " + DesktopHitTest.LastDebug;
+            AppLog.Write("Desktop dblclick FIRE deferred " + DesktopHitTest.LastDebug);
             _onDesktopDoubleClick();
         }
         catch (Exception ex)
